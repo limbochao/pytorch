@@ -711,7 +711,9 @@ def _count_junit_tags(normalized: str) -> collections.Counter[str]:
 @unittest.skipIf(TEST_CUDA or TEST_WITH_ROCM, "junit XML shape doesn't depend on the device")
 class TestJunitXml(TestCase):
     provenance: str
+    golden_skip: str | None
     raw_xml: str
+    output: str
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -719,8 +721,9 @@ class TestJunitXml(TestCase):
         cls.provenance = _junit_provenance()
         header = f"<!-- provenance: {cls.provenance} -->"
         golden = _JUNIT_TESTDATA / "expected" / "pytest.xml"
+        cls.golden_skip = None
         if not _REGENERATE_JUNIT_GOLDENS and golden.exists() and header not in golden.read_text().splitlines():
-            raise unittest.SkipTest(
+            cls.golden_skip = (
                 f"goldens were generated with other versions than {cls.provenance}; "
                 "rerun with REGENERATE_JUNIT_GOLDENS=1"
             )
@@ -744,6 +747,7 @@ class TestJunitXml(TestCase):
                     f"stdout:\n{proc.stdout[-3000:]}\nstderr:\n{proc.stderr[-3000:]}"
                 )
             cls.raw_xml = xml_path.read_text()
+            cls.output = proc.stdout + proc.stderr
         super().setUpClass()
 
     def _assert_matches_golden(self, name: str, doc: str) -> None:
@@ -754,17 +758,20 @@ class TestJunitXml(TestCase):
                 f"<!-- provenance: {self.provenance} -->\n{doc}"
             )
             return
+        if self.golden_skip:
+            self.skipTest(self.golden_skip)
         self.assertTrue(golden.exists(), f"{golden} is missing; generate it with REGENERATE_JUNIT_GOLDENS=1")
         expected = "".join(
             ln for ln in golden.read_text().splitlines(keepends=True) if not ln.startswith("<!--")
         )
         self.assertMultiLineEqual(expected, doc, f"{golden} is stale; rerun with REGENERATE_JUNIT_GOLDENS=1")
 
-    def test_pytest_outcome_shapes(self) -> None:
-        normalized = _normalize_junit_xml(self.raw_xml)
-        self._assert_matches_golden("pytest", normalized)
-
-        counts = _count_junit_tags(normalized)
+    def test_pytest_outcome_counts(self) -> None:
+        # Unlike the goldens, these hold on every pytest version.
+        if "pytest-rerunfailures missing" in self.provenance:
+            self.skipTest("the fixture suite needs pytest-rerunfailures")
+        self.assertNotIn("INTERNALERROR", self.output)
+        counts = _count_junit_tags(_normalize_junit_xml(self.raw_xml))
         # <testsuite tests="14"> counts the teardown error separately, but it merges
         # into its <testcase>
         self.assertEqual(counts["testcase"], 13)
@@ -776,6 +783,9 @@ class TestJunitXml(TestCase):
         self.assertEqual(counts["skipped"], 3)
         # 2 each for rerun_then_pass and rerun_then_fail
         self.assertEqual(counts["rerun"], 4)
+
+    def test_pytest_outcome_shapes(self) -> None:
+        self._assert_matches_golden("pytest", _normalize_junit_xml(self.raw_xml))
 
     def test_sanitize_pytest_xml(self) -> None:
         with TemporaryFileName() as path:
