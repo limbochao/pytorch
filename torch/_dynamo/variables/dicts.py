@@ -27,6 +27,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, cast, TYPE_CHECKING, TypeVar, Union
 from typing_extensions import TypeIs
 
+import torch
 from torch.utils._pytree import MappingKey
 
 from .. import graph_break_hints, polyfills, variables
@@ -96,6 +97,7 @@ from .object_protocol import (
     mro_lookup,
     pysequence_contains,
     repr_guard,
+    vt_identity_compare,
 )
 
 
@@ -135,6 +137,27 @@ def _guard_nan_key(key: VariableTracker) -> None:
     # on their identity, including NaNs nested inside tuple keys.
     if key.source and _contains_nan(_get_literal_key(key)):
         install_guard(key.make_guard(GuardBuilder.ID_MATCH))
+
+
+def _key_has_user_hash(tx: "InstructionTranslatorBase", key: VariableTracker) -> bool:
+    key = key.realize()
+    hash_fn = mro_lookup(key.python_type(), "__hash__")
+    # Inherited hashes consume builtin storage, not overridden iteration.
+    if hash_fn is tuple.__hash__:
+        items = variables.TupleVariable.unpack_var_sequence(
+            cast(variables.TupleVariable, key), tx
+        )
+        return any(_key_has_user_hash(tx, item) for item in items)
+    if hash_fn is frozenset.__hash__:
+        items = variables.FrozensetVariable.unpack_var_sequence(
+            cast(variables.FrozensetVariable, key), tx
+        )
+        return any(_key_has_user_hash(tx, item) for item in items)
+    return not (
+        hash_fn is None
+        or isinstance(hash_fn, types.WrapperDescriptorType)
+        or hash_fn is torch.Tensor.__hash__
+    )
 
 
 # Mirror PyDict_{Check,CheckExact} in Include/cpython/dictobject.h.
@@ -204,6 +227,9 @@ class ConstDictVariable(VariableTracker):
         self,
         items: dict[VariableTracker, VariableTracker]
         | dict[HashableTracker, VariableTracker],
+        *,
+        has_deleted_keys: bool = False,
+        has_reordered_keys: bool = False,
         **kwargs: Any,
     ) -> None:
         # .clone() pass these arguments in kwargs but they're recreated a few
@@ -257,6 +283,9 @@ class ConstDictVariable(VariableTracker):
             not is_from_local_source(self.source) if self.source else True
         )
         self.original_items = {key.vt: value for key, value in self.items.items()}
+        # Reinserting deleted keys still invalidates existing OrderedDict iterators.
+        self.has_deleted_keys = has_deleted_keys
+        self.has_reordered_keys = has_reordered_keys
         # Re-entrancy guard for is_python_constant against self-referential
         # dicts. Both forms re-enter this same instance's is_python_constant, so
         # a per-instance flag suffices.
@@ -815,6 +844,7 @@ class ConstDictVariable(VariableTracker):
                 raise_observed_exception(KeyError, tx, args=[args[0]])
             return args[1]
         self.should_reconstruct_all = True
+        self.has_deleted_keys = True
         tx.output.side_effects.mutation(self)
         if is_proxy:
             del self.items[key]
@@ -840,6 +870,7 @@ class ConstDictVariable(VariableTracker):
             )
         k, v = self.items.popitem()
         self.should_reconstruct_all = True
+        self.has_deleted_keys = True
         tx.output.side_effects.mutation(self)
         return variables.TupleVariable([k.vt, v])
 
@@ -850,6 +881,7 @@ class ConstDictVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         self.should_reconstruct_all = True
+        self.has_deleted_keys = self.has_deleted_keys or bool(self.items)
         tx.output.side_effects.mutation(self)
         self.items.clear()
         return ConstantVariable.create(None)
@@ -1087,6 +1119,7 @@ class ConstDictVariable(VariableTracker):
             except KeyError:
                 raise_observed_exception(KeyError, tx, args=[key])
             self.should_reconstruct_all = True
+            self.has_deleted_keys = True
         else:
             self.items[hkey] = value
         return ConstantVariable.create(None)
@@ -1331,18 +1364,53 @@ class OrderedDictVariable(ConstDictVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        if self.source and any(
+            _key_has_user_hash(tx, key) for key in (*self.original_items, args[0])
+        ):
+            # Replay applies native moves after tracing their hash callbacks.
+            # Skip the whole frame so fallback does not replay callbacks twice.
+            unimplemented(
+                gb_type="OrderedDict mutation with user-defined hash",
+                context="OrderedDict.move_to_end",
+                explanation="Dynamo cannot replay input OrderedDict moves without repeating user hash callbacks.",
+                hints=["Construct the OrderedDict inside the compiled function."],
+                skip_frame=True,
+            )
         self.install_dict_keys_match_guard()
+        # The endpoint identity shortcut also depends on the input's key order.
+        # Hook IDs cannot be exempted: a changed ID can turn a no-op into KeyError.
+        if self.source:
+            tx.output.guard_on_key_order.add(self.source)
+            install_guard(self.make_guard(GuardBuilder.ORDERED_DICT_KEYS_MATCH))
+        if not self.items:
+            raise_observed_exception(KeyError, tx, args=[args[0]])
+
+        last_arg = kwargs.get(
+            "last", args[1] if len(args) == 2 else ConstantVariable.create(True)
+        )
+        last = specialize_symnode(generic_is_true(tx, last_arg)).as_python_constant()
+
+        _guard_nan_key(args[0])
+        endpoint = next(
+            HashableTracker.iter_keys_by_identity(
+                reversed(self.items) if last else self.items
+            )
+        )
+        same_key = vt_identity_compare(args[0], endpoint.vt)
+        if same_key is not None and same_key.as_python_constant():
+            return ConstantVariable.create(None)
+        key = HashableTracker(args[0])
+        if key not in self.items:
+            raise_observed_exception(KeyError, tx, args=[args[0]])
         tx.output.side_effects.mutation(self)
-        if args[0] not in self:
-            raise_observed_exception(KeyError, tx)
-
-        last = True
-        if len(args) == 2 and args[0].is_python_constant():
-            last = args[1].as_python_constant()
-        if "last" in kwargs and kwargs["last"].is_python_constant():
-            last = kwargs["last"].as_python_constant()
-
-        self.items.move_to_end(HashableTracker(args[0]), last=last)
+        self.items.move_to_end(key, last=last)
+        # Later moves can restore the order without restoring valid iterators.
+        self.has_reordered_keys = self.has_reordered_keys or endpoint is not next(
+            HashableTracker.iter_keys_by_identity(
+                reversed(self.items) if last else self.items
+            )
+        )
+        self.should_reconstruct_all = True
         return ConstantVariable.create(None)
 
     def popitem(
@@ -1365,6 +1433,7 @@ class OrderedDictVariable(ConstDictVariable):
 
         k, v = self.items.popitem(last=last)
         self.should_reconstruct_all = True
+        self.has_deleted_keys = True
         tx.output.side_effects.mutation(self)
         return variables.TupleVariable([k.vt, v])
 

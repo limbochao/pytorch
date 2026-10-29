@@ -1114,6 +1114,16 @@
       "Hints": []
     }
   ],
+  "GB4179": [
+    {
+      "Gb_type": "OrderedDict mutation with user-defined hash",
+      "Context": "OrderedDict.move_to_end",
+      "Explanation": "Dynamo cannot replay input OrderedDict moves without repeating user hash callbacks.",
+      "Hints": [
+        "Construct the OrderedDict inside the compiled function."
+      ]
+    }
+  ],
   "GB0066": [
     {
       "Gb_type": "Graph break under GenericContextWrappingVariable",
@@ -3701,6 +3711,14 @@
       "Hints": [
         "Write the repr method in Python"
       ]
+    }
+  ],
+  "GB2214": [
+    {
+      "Gb_type": "Unsupported OrderedDict instance dictionary",
+      "Context": "OrderedDict.__dict__",
+      "Explanation": "A dictionary subclass used as instance state could also be a linked key, so Dynamo cannot inspect the order without invoking user hashes.",
+      "Hints": []
     }
   ],
   "GB8395": [
