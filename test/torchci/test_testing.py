@@ -615,6 +615,14 @@ class TestGetPytestTestCases(TestCase):
         # Node ids are relative to the rootdir; children run from our cwd.
         self.assertTrue(os.path.samefile(ids[0].split("::", 1)[0], __file__), ids)
 
+    def test_collection_failure_raises(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "pytest test collection failed"):
+            get_pytest_test_cases([__file__, "--no-such-pytest-flag"])
+
+    def test_no_tests_selected_is_not_a_failure(self) -> None:
+        # An empty shard, or -k selecting nothing, is NO_TESTS_COLLECTED.
+        self.assertEqual(get_pytest_test_cases([__file__, "-k", "no_such_test"]), [])
+
 
 # gtest's JSON test list (--gtest_list_tests --gtest_output=json:<file>), with the
 # fields gtest_identities reads.
