@@ -3193,6 +3193,22 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     hints=[*graph_break_hints.FUNDAMENTAL],
                 )
 
+            if (
+                isinstance(method, types.MethodDescriptorType)
+                and method.__objclass__ is not object
+                and not is_torch_class(method.__objclass__)
+                and name not in self._slotdefs
+                and not trace_rules.is_polyfilled_callable(method)
+            ):
+                # Inherited non-slot C methods beyond object without Torch/polyfill
+                # handling dispatch through their defining descriptor. This includes
+                # ordinary inheritance and aliases such as `copy = dict.copy`.
+                return variables.MethodDescriptorVariable(
+                    method, owner=VariableTracker.build(tx, method.__objclass__)
+                ).call_function(tx, [self, *args], kwargs)
+
+            # Slots, Torch methods and registered polyfills retain their specialized
+            # paths; Python overrides continue through UserMethodVariable below.
             overloaded = (
                 self._base_methods is not None and method not in self._base_methods
             )
@@ -3202,10 +3218,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 if result is not None:
                     return result
 
-            # Non-overridden base-class methods dispatch to the base VT via super()
-            # (self is-a base VT under multiple inheritance).  Skip comparison ops:
-            # they go through tp_richcompare_impl on the UserDefined*Variable
-            # subclass, which avoids tracing tensor elements via list_cmp.
+            # Remaining non-slot base methods (polyfilled C descriptors and methods
+            # of other types) use the base VT. Slot names stay on the subclass's
+            # protocol path, including comparisons of tensor elements.
             if (
                 self._base_methods is not None
                 and method in self._base_methods
@@ -5972,6 +5987,8 @@ class SimpleNamespaceVariable(UserDefinedObjectVariable):
 
     ref: https://github.com/python/cpython/blob/3.13/Objects/namespaceobject.c
     """
+
+    _cpython_type = types.SimpleNamespace
 
     @staticmethod
     def is_matching_cls(cls: type) -> bool:

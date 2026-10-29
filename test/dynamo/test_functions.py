@@ -4,6 +4,7 @@ import cmath
 import collections
 import collections.abc
 import contextlib
+import contextvars
 import enum
 import functools
 import inspect
@@ -6851,6 +6852,24 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(opt_fn(x), fn(x))
         self.assertEqual(opt_fn(x)[1:3], ("Renamed.get", "Renamed.fromkeys"))
 
+    @parametrize("bound", [False, True])
+    @parametrize("kind", ["repeat", "contextvar"])
+    def test_method_descriptor_tracker_type(self, bound, kind):
+        descriptor = (
+            itertools.repeat.__length_hint__
+            if kind == "repeat"
+            else contextvars.ContextVar.get
+        )
+        context = contextvars.ContextVar("value", default=3)
+
+        def fn(x):
+            receiver = itertools.repeat(1, 3) if kind == "repeat" else context
+            value = descriptor.__get__(receiver)() if bound else descriptor(receiver)
+            return x + value
+
+        x = torch.ones(1)
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
     def test_unbound_method_descriptor_call(self):
         # list.count read off the type inside the frame is a method_descriptor;
         # calling it runs the C method even when the receiver's class overrides
@@ -6879,6 +6898,59 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(expected[0], x + 2)
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(opt_fn(x), expected)
+
+    @parametrize("names", [("__add__", "__mul__"), ("append", "pop")])
+    def test_unbound_descriptor_comparison(self, names):
+        def fn(x):
+            first = getattr(list, names[0])
+            same = getattr(list, names[0])
+            other = getattr(list, names[1])
+            comparisons = (
+                first == same,
+                first != same,
+                first == other,
+                first != other,
+                first.__eq__(other),
+                first.__ne__(other),
+            )
+            errors = []
+            for op in (operator.lt, operator.le, operator.gt, operator.ge):
+                try:
+                    op(first, same)
+                except TypeError as exc:
+                    errors.append(str(exc))
+            return x + 1, comparisons, errors
+
+        x = torch.ones(1)
+        expected = fn(x)
+        self.assertEqual(
+            expected[1], (True, False, False, True, NotImplemented, NotImplemented)
+        )
+        self.assertEqual(len(expected[2]), 4)
+        self.assertEqual(
+            torch.compile(fn, backend="eager", fullgraph=True)(x), expected
+        )
+
+    @parametrize("bound", [False, True])
+    def test_method_descriptor_list_subclass_getitem(self, bound):
+        class List(list):
+            def __getitem__(self, index):
+                if bound:
+                    result = list.__getitem__.__get__(self)(index)
+                else:
+                    result = list.__getitem__(self, index)
+                return result if isinstance(index, slice) else result + 100
+
+        def fn(x):
+            values = List([x, x + 1, x + 2])
+            return values[0], values[-1], values[1:]
+
+        x = torch.ones(1)
+        expected = fn(x)
+        self.assertEqual(expected[:2], (x + 100, x + 102))
+        actual = torch.compile(fn, backend="eager", fullgraph=True)(x)
+        self.assertEqual(actual, expected)
+        self.assertIs(type(actual[2]), list)
 
     def test_method_descriptor_list_count_tensor_equality(self):
         def fn(x):
@@ -7129,7 +7201,103 @@ class GraphModule(torch.nn.Module):
         with self.assertRaisesRegex(RuntimeError, msg):
             torch.compile(fn, backend="eager")(x)
 
-    def test_method_descriptor_preserves_polyfill_trace_rule(self):
+    @parametrize(
+        "base, method",
+        [
+            (list, "append"),
+            (set, "add"),
+            (collections.deque, "appendleft"),
+            (list, "pop"),
+        ],
+    )
+    @parametrize("aliased", [False, True])
+    def test_method_descriptor_mutates_container_subclass(self, base, method, aliased):
+        class Container(base):
+            mutate = getattr(base, method)
+
+        def fn(x):
+            container = Container([1, 2])
+            result = getattr(container, "mutate" if aliased else method)(
+                0 if method == "pop" else 3
+            )
+            return x + 1, list(container), result
+
+        x = torch.ones(1)
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
+    def test_method_descriptor_autograd_engine_callback(self):
+        calls = []
+
+        def callback():
+            calls.append("called")
+
+        class Callback(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                return x * 2
+
+            @staticmethod
+            def backward(ctx, grad):
+                torch.autograd.Variable._execution_engine.queue_callback(callback)
+                return grad * 2
+
+        def compiler_fn(gm):
+            return torch.compile(gm, backend="eager", fullgraph=True)
+
+        x = torch.ones(1, requires_grad=True)
+        with torch._dynamo.compiled_autograd._enable(compiler_fn):
+            Callback.apply(x).sum().backward()
+        self.assertEqual(x.grad, torch.full_like(x, 2))
+        self.assertEqual(calls, ["called"])
+
+    def test_builtin_wrapper_descriptor_inherited_from_object(self):
+        class Mapping(dict):
+            def __setattr__(self, name, value):
+                raise AssertionError("must bypass the override")
+
+            def __repr__(self):
+                return "mapping"
+
+        def fn(x):
+            mapping = Mapping()
+            dict.__setattr__(mapping, "extra", x + 1)
+            return mapping.extra, list.__str__(mapping)
+
+        x = torch.ones(1)
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
+    def test_builtin_wrapper_descriptor_missing_receiver(self):
+        def fn(x):
+            try:
+                list.__str__()
+            except TypeError as exc:
+                return x + 1, str(exc)
+            return x - 1, "no error"
+
+        x = torch.ones(1)
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
+    @parametrize(
+        "method, args",
+        [
+            ("__dir__", ()),
+            ("__sizeof__", ()),
+            ("__format__", ("",)),
+            ("__reduce__", ()),
+        ],
+    )
+    def test_object_method_descriptor_error_owner(self, method, args):
+        class C:
+            pass
+
+        def fn(x, obj):
+            return x + 1, getattr(obj, method)(*args)
+
+        with self.assertRaisesRegex(Unsupported, f"method `{method}` of class `C`"):
+            torch.compile(fn, backend="eager", fullgraph=True)(torch.ones(1), C())
+
+    @parametrize("bound", [False, True])
+    def test_method_descriptor_preserves_polyfill_trace_rule(self, bound):
         class C:
             def __init__(self, value):
                 self.value = value
@@ -7137,12 +7305,28 @@ class GraphModule(torch.nn.Module):
         descriptor = object.__reduce_ex__
 
         def fn(obj):
-            reduction = descriptor(obj, 4)
+            reduction = obj.__reduce_ex__(4) if bound else descriptor(obj, 4)
             return reduction[2]["value"] + 1
 
         obj = C(torch.ones(1))
         self.assertEqual(
             torch.compile(fn, backend="eager", fullgraph=True)(obj), fn(obj)
+        )
+
+    @unittest.skipIf(sys.version_info < (3, 13), "__replace__ added in 3.13")
+    @parametrize("bound", [False, True])
+    def test_method_descriptor_namespace_replace(self, bound):
+        def fn(x, obj):
+            if bound:
+                result = obj.__replace__(value=x + 1)
+            else:
+                result = types.SimpleNamespace.__replace__(obj, value=x + 1)
+            return result.value, obj.value, type(result), result is obj
+
+        x = torch.ones(1)
+        obj = types.SimpleNamespace(value=x)
+        self.assertEqual(
+            torch.compile(fn, backend="eager", fullgraph=True)(x, obj), fn(x, obj)
         )
 
     def test_classmethod_descriptor_mro_sources(self):
