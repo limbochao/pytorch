@@ -287,6 +287,11 @@ class Vectorized<float> {
     }
     return loadu(tmp);
   }
+  // A NaN (all bits set) where mask is true, this otherwise.
+  Vectorized<float> orNanIf(const Vectorized<float>& mask) const {
+    return Vectorized<float>(vreinterpretq_f32_u32(
+        vorrq_u32(vreinterpretq_u32_f32(values), vreinterpretq_u32_f32(mask))));
+  }
   Vectorized<float> abs() const {
     return Vectorized<float>(vabsq_f32(values));
   }
