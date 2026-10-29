@@ -1715,7 +1715,9 @@ class DictTests(torch._dynamo.test_case.TestCase):
             fn(x, mapping),
         )
 
-    @parametrize("reported_type", [dict, OrderedDict])
+    @parametrize(
+        "reported_type", [dict, OrderedDict, getattr(builtins, "frozendict", dict)]
+    )
     def test_input_object_reporting_dict_class(self, reported_type):
         class Proxy:
             value = 2

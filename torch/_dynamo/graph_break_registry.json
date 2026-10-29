@@ -1714,16 +1714,6 @@
       "Hints": []
     }
   ],
-  "GB9539": [
-    {
-      "Gb_type": "frozendict subclass allocation",
-      "Context": "frozendict.__new__",
-      "Explanation": "Dynamo does not yet support allocating frozendict subclasses.",
-      "Hints": [
-        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
-      ]
-    }
-  ],
   "GB0105": [
     {
       "Gb_type": "Tensor.numpy() with trace_numpy=False",
@@ -6875,16 +6865,6 @@
       "Gb_type": "Frozen dataclass with missing field",
       "Context": "dataclass={dataclass_cls.__name__}, field={field.name}",
       "Explanation": "Cannot reconstruct frozen dataclass: field '{field.name}' was not tracked during tracing.",
-      "Hints": [
-        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
-      ]
-    }
-  ],
-  "GB1146": [
-    {
-      "Gb_type": "frozendict subclass methods",
-      "Context": "str(type(args[0]))",
-      "Explanation": "Dynamo cannot access this dictionary's stored keys and values.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
