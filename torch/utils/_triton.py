@@ -1,5 +1,6 @@
 import functools
 import hashlib
+import importlib.util
 import logging
 import os
 from typing import Any
@@ -277,6 +278,14 @@ def has_triton_reduction_ordering() -> bool:
         except ImportError:
             pass
     return False
+
+
+@functools.cache
+def has_triton_compile_iq() -> bool:
+    """Whether the available Triton is fbtriton with the compile_iq (magnon) hooks."""
+    if not has_triton_package():
+        return False
+    return importlib.util.find_spec("triton.magnon") is not None
 
 
 @functools.cache

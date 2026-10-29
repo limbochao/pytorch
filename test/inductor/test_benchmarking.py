@@ -1,7 +1,10 @@
 # Owner(s): ["module: inductor"]
 
 import contextlib
+import os
+import sys
 import threading
+import types
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +16,7 @@ from torch._inductor.config import (
 )
 from torch._inductor.runtime.benchmarking import (
     _get_default_gpu_device_type,
+    _triton_benchmarking_context,
     Benchmarker,
     InductorBenchmarker,
     TorchProfilerBenchmarker,
@@ -744,6 +748,117 @@ class TestGpuBenchmarkDeviceTypes(TestCase):
         sentinel = "privateuse1_test_device"
         with patch("torch._inductor.utils.get_gpu_type", return_value=sentinel):
             self.assertEqual(_get_default_gpu_device_type(), sentinel)
+
+
+_BENCHMARKING = "torch._inductor.runtime.benchmarking"
+
+
+class TestTritonBenchmarkingContext(TestCase):
+    def setUp(self):
+        super().setUp()
+        _triton_benchmarking_context.cache_clear()
+        self.addCleanup(_triton_benchmarking_context.cache_clear)
+
+    def test_enters_collector_benchmarking_context(self):
+        active = False
+        entered = 0
+
+        @contextlib.contextmanager
+        def benchmarking():
+            nonlocal active, entered
+            entered += 1
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        collector = types.ModuleType("triton.magnon.collector")
+        collector.benchmarking = benchmarking
+        seen_active = []
+        with (
+            patch.dict(os.environ, {"TRITON_COMPILE_IQ_COLLECT": "1"}),
+            patch.dict(sys.modules, {"triton.magnon.collector": collector}),
+            patch(f"{_BENCHMARKING}.has_triton_compile_iq", return_value=True),
+        ):
+            Benchmarker().benchmark_cpu(
+                lambda: seen_active.append(active), warmup=0, rep=0
+            )
+        self.assertEqual(entered, 1)
+        self.assertTrue(seen_active)
+        self.assertTrue(all(seen_active))
+        self.assertFalse(active)
+
+    def test_do_bench_using_profiling_enters_collector_benchmarking_context(self):
+        from torch._inductor import utils as inductor_utils
+
+        active = False
+        entered = 0
+
+        @contextlib.contextmanager
+        def benchmarking():
+            nonlocal active, entered
+            entered += 1
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        def fake_do_bench_using_profiling(fn, warmup, rep, is_vetted_benchmarking):
+            fn()
+            return 1.0
+
+        collector = types.ModuleType("triton.magnon.collector")
+        collector.benchmarking = benchmarking
+        seen_active = []
+        with (
+            patch.dict(os.environ, {"TRITON_COMPILE_IQ_COLLECT": "1"}),
+            patch.dict(sys.modules, {"triton.magnon.collector": collector}),
+            patch(f"{_BENCHMARKING}.has_triton_compile_iq", return_value=True),
+            patch.object(
+                inductor_utils,
+                "_do_bench_using_profiling",
+                side_effect=fake_do_bench_using_profiling,
+            ),
+        ):
+            inductor_utils.do_bench_using_profiling(lambda: seen_active.append(active))
+        self.assertEqual(entered, 1)
+        self.assertEqual(seen_active, [True])
+        self.assertFalse(active)
+
+    def test_import_error_falls_back_to_nullcontext(self):
+        with (
+            patch.dict(os.environ, {"TRITON_COMPILE_IQ_COLLECT": "1"}),
+            # A None entry makes the import raise ImportError.
+            patch.dict(sys.modules, {"triton.magnon.collector": None}),
+            patch(f"{_BENCHMARKING}.has_triton_compile_iq", return_value=True),
+            self.assertLogs(_BENCHMARKING, level="WARNING") as logs,
+        ):
+            self.assertIs(_triton_benchmarking_context(), contextlib.nullcontext)
+            Benchmarker().benchmark_cpu(lambda: None, warmup=0, rep=0)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("TRITON_COMPILE_IQ_COLLECT", logs.output[0])
+
+    def test_without_fbtriton_skips_collector_import(self):
+        collector = types.ModuleType("triton.magnon.collector")
+        collector.benchmarking = lambda: contextlib.nullcontext()
+        with (
+            patch.dict(os.environ, {"TRITON_COMPILE_IQ_COLLECT": "1"}),
+            patch.dict(sys.modules, {"triton.magnon.collector": collector}),
+            patch(f"{_BENCHMARKING}.has_triton_compile_iq", return_value=False),
+        ):
+            self.assertIs(_triton_benchmarking_context(), contextlib.nullcontext)
+
+    def test_collect_unset_uses_nullcontext(self):
+        collector = types.ModuleType("triton.magnon.collector")
+        collector.benchmarking = lambda: contextlib.nullcontext()
+        with (
+            patch.dict(os.environ),
+            patch.dict(sys.modules, {"triton.magnon.collector": collector}),
+        ):
+            os.environ.pop("TRITON_COMPILE_IQ_COLLECT", None)
+            self.assertIs(_triton_benchmarking_context(), contextlib.nullcontext)
 
 
 if __name__ == "__main__":

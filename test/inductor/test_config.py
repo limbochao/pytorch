@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 import functools
 import math
+import os
 import unittest
 import unittest.mock
 
@@ -90,6 +91,46 @@ class TestInductorConfig(TestCase):
             ):
                 with self.assertWarns(FutureWarning):
                     self.assertFalse(triton_utils.use_block_ptr_enabled())
+
+    @parametrize("env_var", ["TRITON_COMPILE_IQ_COLLECT", "TRITON_COMPILE_IQ_APPLY"])
+    def test_static_cuda_launcher_default_off_for_compile_iq(self, env_var):
+        with (
+            unittest.mock.patch.dict(os.environ, {env_var: "1"}),
+            unittest.mock.patch(
+                "torch.utils._triton.has_triton_compile_iq", return_value=True
+            ),
+        ):
+            self.assertFalse(config.static_cuda_launcher_default())
+
+    @parametrize("env_var", ["TRITON_COMPILE_IQ_COLLECT", "TRITON_COMPILE_IQ_APPLY"])
+    def test_static_cuda_launcher_default_ignores_compile_iq_without_fbtriton(
+        self, env_var
+    ):
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {env_var: "1", "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER": "1"},
+            ),
+            unittest.mock.patch(
+                "torch.utils._triton.has_triton_compile_iq", return_value=False
+            ),
+        ):
+            self.assertTrue(config.static_cuda_launcher_default())
+
+    @parametrize("env_var", ["TRITON_COMPILE_IQ_COLLECT", "TRITON_COMPILE_IQ_APPLY"])
+    def test_compile_iq_overrides_static_cuda_launcher_env(self, env_var):
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {env_var: "1", "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER": "1"},
+            ),
+            unittest.mock.patch(
+                "torch.utils._triton.has_triton_compile_iq", return_value=True
+            ),
+            self.assertLogs("torch._inductor.config", level="WARNING") as logs,
+        ):
+            self.assertFalse(config.static_cuda_launcher_default())
+        self.assertIn("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=1", logs.output[0])
 
     def test_hasattr(self):
         self.assertTrue(hasattr(config, "max_fusion_size"))
