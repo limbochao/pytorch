@@ -636,6 +636,88 @@ AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cuda_caching_allocator_raw_alloc(
 AOTI_TORCH_EXPORT AOTITorchError
 aoti_torch_cuda_caching_allocator_raw_delete(void* ptr);
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+// CUDA graph capture: thin wrappers over at::cuda::MemPool and
+// at::cuda::CUDAGraph, with that C++ API's contract rather than
+// torch.cuda.graph's: no warm-up, synchronization or tensor lifetime
+// management. capture_begin and capture_end use the current stream, which
+// must be on the pool's device; replay uses the current stream of the
+// capture's device. A graph captures once.
+// capture_begin fails under the cudaMallocAsync allocator backend, where
+// CUDAGraph ignores the pool, allows only one capture at a time in the
+// process, and aborts when a failed capture's tensors are freed. Callers must:
+// - capture on a cudaStreamNonBlocking stream;
+// - end every capture whose capture_begin succeeded with capture_end, on its
+//   thread and stream, before deleting the graph, also when the captured work
+//   failed. On ROCm, a stream whose capture was invalidated rejects work
+//   until the next capture begins;
+// - use a pool and its graphs from one thread at a time, capture into a pool
+//   one graph at a time, and use a new pool once every graph that began a
+//   capture into it is deleted;
+// - not overlap replays of graphs sharing a pool, and use a replay's outputs
+//   before replaying another graph of the pool, unless replaying in capture
+//   order;
+// - not replay a graph that uses random numbers while other replays or eager
+//   random number work run on the same device: a replay advances the
+//   device's generator without taking its lock;
+// - order earlier work on the capture stream before a replay on another
+//   stream, and wait for a graph's replays before deleting it;
+// - on ROCm, keep synchronous HIP copies and memsets out of the process
+//   while a capture is open: HIP fails them and invalidates every open
+//   capture, see https://github.com/ROCm/rocm-systems/issues/12677. Creating
+//   a hipBLASLt handle makes such a call and then ends or hangs the process;
+//   capture_begin and a thread's first hipBLASLt use, e.g. an eager matmul
+//   or convolution, can create one.
+struct CUDAMemPoolOpaque;
+using CUDAMemPoolHandle = CUDAMemPoolOpaque*;
+
+struct CUDAGraphOpaque;
+using CUDAGraphHandle = CUDAGraphOpaque*;
+
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_create_cuda_mem_pool(
+    int32_t device_index,
+    CUDAMemPoolHandle* ret_pool // returns new reference
+);
+
+// Graphs captured into the pool keep its memory until they are deleted.
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_delete_cuda_mem_pool(CUDAMemPoolHandle pool);
+
+// keep_graph and num_rng_states are at::cuda::CUDAGraph's constructor
+// arguments, which torch.cuda.CUDAGraph defaults to false and 8. With
+// keep_graph, the captured graph is kept and the first replay instantiates it.
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_create_cuda_graph(
+    int32_t keep_graph,
+    int64_t num_rng_states,
+    CUDAGraphHandle* ret_graph // returns new reference
+);
+
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_delete_cuda_graph(CUDAGraphHandle graph);
+
+// capture_mode is a cudaStreamCaptureMode. cudaStreamCaptureModeThreadLocal
+// restricts only the capturing thread, so other inference threads keep
+// running; cudaStreamCaptureModeGlobal also restricts them.
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cuda_graph_capture_begin(
+    CUDAGraphHandle graph,
+    CUDAMemPoolHandle pool,
+    int32_t capture_mode);
+
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_cuda_graph_capture_end(CUDAGraphHandle graph);
+
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_cuda_graph_replay(CUDAGraphHandle graph);
+
+// torch._foreach_copy_(dst, src) on the current stream: copies each src
+// tensor into the dst tensor at the same index, fusing copies that share a
+// dtype, e.g. for a caller copying inputs into a graph's static buffers.
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cuda_foreach_copy_(
+    const AtenTensorHandle* dst,
+    const AtenTensorHandle* src,
+    int64_t num_tensors);
+#endif // TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+
 #endif // USE_CUDA
 
 // See `ProxyExecutor Design Note` in ir.py for more details
