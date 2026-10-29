@@ -1436,6 +1436,7 @@ def get_pytest_test_cases(argv: list[str]) -> list[str]:
         def pytest_collection_finish(self, session):
             for item in session.items:
                 # Node ids are relative to the rootdir, but children run from our cwd.
+                # Assumes the test file is on the cwd's drive: relpath raises across Windows drives.
                 path = os.path.relpath(item.path, session.config.invocation_params.dir)
                 self.tests.append(f"{path}::{item.nodeid.split('::', 1)[1]}")
 

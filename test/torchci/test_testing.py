@@ -22,6 +22,7 @@ from typing import Any
 import torch
 from torch.testing._internal import common_utils
 from torch.testing._internal.common_utils import (
+    get_pytest_test_cases,
     instantiate_parametrized_tests,
     IS_SANDCASTLE,
     IS_WINDOWS,
@@ -598,6 +599,21 @@ class TestReportEnablement(TestCase):
                 unittest.mock.patch.object(torch.version, "xpu", xpu),
             ):
                 self.assertEqual(default(), expected)
+
+
+@unittest.skipIf(__name__ != "__main__", "--use-main-module collects from __main__")
+class TestGetPytestTestCases(TestCase):
+    """get_pytest_test_cases collects the ids run_tests --subprocess --use-pytest
+    hands to each child as --pytest-single-test."""
+
+    def test_ids_resolve_from_cwd(self) -> None:
+        ids = get_pytest_test_cases([__file__, "-k", "test_ids_resolve_from_cwd"])
+        self.assertEqual(
+            [i.split("::", 1)[1] for i in ids],
+            ["TestGetPytestTestCases::test_ids_resolve_from_cwd"],
+        )
+        # Node ids are relative to the rootdir; children run from our cwd.
+        self.assertTrue(os.path.samefile(ids[0].split("::", 1)[0], __file__), ids)
 
 
 # gtest's JSON test list (--gtest_list_tests --gtest_output=json:<file>), with the
