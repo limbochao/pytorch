@@ -108,6 +108,12 @@ def main():
                         log_path.write_text(result["message"] + "\n")
                         print(f"unsupported: {result['message']}", flush=True)
                     else:
+                        overrides = {"CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"]}
+                        if suite == "timm_models":
+                            overrides.update(
+                                HF_ENDPOINT="https://hf-mirror.com", TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1",
+                            )
+                        run_env = dict(env, **overrides)
                         command = [
                             sys.executable, "-u", str(runner_dir / f"{suite}.py"),
                             "--performance", "--repeat", "1", "--iterations", "1", "--iterations-per-run", "1",
@@ -117,12 +123,12 @@ def main():
                             "--output", "result.csv", "--output-directory", str(run_dir),
                         ]
                         (run_dir / "command.sh").write_text(
-                            f"export CUDA_VISIBLE_DEVICES={shlex.quote(env['CUDA_VISIBLE_DEVICES'])}\n"
-                            f"cd {shlex.quote(str(runner_dir))}\n{shlex.join(command)}\n"
+                            "".join(f"export {key}={shlex.quote(value)}\n" for key, value in overrides.items())
+                            + f"cd {shlex.quote(str(runner_dir))}\n{shlex.join(command)}\n"
                         )
                         with log_path.open("w") as log:
                             with subprocess.Popen(
-                                command, cwd=runner_dir, env=env, stdout=subprocess.PIPE,
+                                command, cwd=runner_dir, env=run_env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace",
                             ) as process:
                                 try:

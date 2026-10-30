@@ -9,6 +9,45 @@ import sys
 import warnings
 
 
+def configure_timm_downloads():
+    if os.environ.get("TORCHBENCH_TIMM_SKIP_SSL_VERIFY") != "1":
+        return
+
+    import ssl
+    from urllib.request import build_opener, HTTPSHandler, install_opener
+
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    ssl._create_default_https_context = ssl._create_unverified_context
+    install_opener(build_opener(HTTPSHandler(context=ssl._create_unverified_context())))
+
+    import huggingface_hub
+
+    if hasattr(huggingface_hub, "configure_http_backend"):
+        import requests
+
+        def backend_factory():
+            session = requests.Session()
+            session.verify = False
+            return session
+
+        huggingface_hub.configure_http_backend(backend_factory=backend_factory)
+    else:
+        from huggingface_hub.utils._http import default_client_factory
+
+        def client_factory():
+            with default_client_factory() as client:
+                return type(client)(
+                    verify=False, follow_redirects=True, timeout=client.timeout, event_hooks=client.event_hooks,
+                )
+
+        huggingface_hub.set_client_factory(client_factory)
+    print(f"[download] HF_ENDPOINT={os.environ.get('HF_ENDPOINT')}; certificate verification disabled", flush=True)
+
+
+configure_timm_downloads()
+
+
 try:
     from .common import BenchmarkRunner, download_retry_decorator, load_yaml_file, main
     from .npu_batch_sizes import get_npu_batch_size
