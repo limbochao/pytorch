@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -50,6 +51,37 @@ void checkSameDtype(
     const std::string& name) {
   return desc.empty() ? name : c10::str(desc, ':', name);
 }
+
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+// A communicator listed for dumpNcclComms(). Dumps hold mutex shared.
+// unlistComm() clears live before the communicator is aborted, revoked or
+// destroyed, then waits (bounded) for dumps to release mutex.
+struct LiveComm {
+  std::shared_timed_mutex mutex;
+  std::atomic<bool> live{true};
+  ncclComm_t comm;
+  // How long unlistComm() waits for a dump. Read at publish, as reading the
+  // env var can throw and unlistComm() runs in the destructor.
+  std::chrono::milliseconds unlistTimeout;
+  // Group name; guarded by liveCommsMutex().
+  std::string name;
+};
+
+// Live communicators, keyed by owning backend. Added in publishComm() and
+// dropped in unlistComm().
+std::mutex& liveCommsMutex() {
+  static std::mutex m;
+  return m;
+}
+
+using LiveComms =
+    std::unordered_map<const ProcessGroupNCCL*, std::shared_ptr<LiveComm>>;
+
+LiveComms& liveComms() {
+  static LiveComms comms;
+  return comms;
+}
+#endif
 
 } // namespace
 
@@ -98,7 +130,8 @@ void waitForNcclChildComm(
     ncclResult_t status,
     bool expect_child,
     std::chrono::milliseconds timeout,
-    std::string_view operation) {
+    std::string_view operation,
+    const std::function<void()>& before_parent_abort) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const auto remaining = [&] {
     const auto now = std::chrono::steady_clock::now();
@@ -151,6 +184,9 @@ void waitForNcclChildComm(
       }
     };
     if (status == ncclSuccess || status == ncclInProgress) {
+      if (before_parent_abort) {
+        before_parent_abort();
+      }
       abortComm(parent_comm, "Failed to abort parent NCCL communicator");
     }
     if (*child_comm != nullptr) {
@@ -237,6 +273,9 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       nccl_comm_ = nullptr;
     }
   }
+
+  // A finalize() that threw before destroying the communicator left it listed.
+  unlistComm();
 
   // We need to detach the memory hook in case finalize is not called,
   // so that we don't encounter a memory corruption.
@@ -338,12 +377,20 @@ void ProcessGroupNCCL::initNcclResources() {
       nccl_api_->commCount(nccl_comm_, &comm_size_),
       "NCCL Count failed");
 
-  if (!blocking_wait_ && !shutdown_) {
-    timeout_thread_ = std::thread(&ProcessGroupNCCL::timeoutWatchdog, this);
-  }
-
-  attachMemoryHook();
+  // Before the watchdog starts: it can abort the communicator, and a throw
+  // here must not leave a joinable thread behind.
   publishComm();
+
+  try {
+    if (!blocking_wait_ && !shutdown_) {
+      timeout_thread_ = std::thread(&ProcessGroupNCCL::timeoutWatchdog, this);
+    }
+    attachMemoryHook();
+  } catch (...) {
+    // init_state_ stays uninitialized, so no teardown path would retire it.
+    retireComm();
+    throw;
+  }
 }
 
 void ProcessGroupNCCL::initFromComm(
@@ -447,7 +494,8 @@ c10::intrusive_ptr<::c10d::Backend> ProcessGroupNCCL::split(
         splitStatus,
         newRank != -1,
         ncclOpts->timeout,
-        "NCCL split failed");
+        "NCCL split failed",
+        [this] { unlistComm(); });
   } catch (...) {
     comm_state_ = CommState::ERROR;
     // The failed call may have aborted the parent; drop its symmetric-memory
@@ -784,14 +832,99 @@ int64_t ProcessGroupNCCL::getCommPtr() const {
 }
 
 void ProcessGroupNCCL::publishComm() {
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+  // Built before publishing: getCvarInt throws on a malformed value.
+  auto entry = std::make_shared<LiveComm>();
+  entry->comm = nccl_comm_;
+  entry->unlistTimeout = std::chrono::milliseconds(
+      getCvarInt(::c10d::TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC, 15 * 1000));
+  entry->name = getGroupUid();
+#endif
   ::c10d::publishNCCLComm(
       getGroupUid(), reinterpret_cast<void*>(nccl_comm_), device_);
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+  std::lock_guard<std::mutex> lock(liveCommsMutex());
+  liveComms()[this] = std::move(entry);
+#endif
 }
 
 void ProcessGroupNCCL::retireComm() {
   ::c10d::retireNCCLComm(
       getGroupUid(), reinterpret_cast<void*>(nccl_comm_), device_);
+  unlistComm();
 }
+
+void ProcessGroupNCCL::unlistComm() {
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+  std::shared_ptr<LiveComm> entry;
+  {
+    std::lock_guard<std::mutex> lock(liveCommsMutex());
+    auto it = liveComms().find(this);
+    if (it == liveComms().end()) {
+      return;
+    }
+    entry = std::move(it->second);
+    liveComms().erase(it);
+  }
+  // New dumps skip the communicator. One already in ncclCommDump might hang, so
+  // wait for it only as long as the abort path waits for a dump; past that the
+  // communicator is torn down under it, as in ProcessGroupNCCL.
+  entry->live = false;
+  std::unique_lock<std::shared_timed_mutex> lock(
+      entry->mutex, entry->unlistTimeout);
+  if (!lock.owns_lock()) {
+    TC_LOG(WARNING, this) << "Tearing down NCCL communicator after waiting "
+                          << entry->unlistTimeout.count()
+                          << "ms for an ncclCommDump";
+  }
+#endif
+}
+
+void ProcessGroupNCCL::setGroupUid(const std::string& pg_uid) {
+  Backend::setGroupUid(pg_uid);
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+  // Keeps the dumpNcclComms() key equal to the group name, e.g. after a shrink
+  // renames the child it published under the parent's name.
+  std::lock_guard<std::mutex> lock(liveCommsMutex());
+  auto it = liveComms().find(this);
+  if (it != liveComms().end()) {
+    it->second->name = pg_uid;
+  }
+#endif
+}
+
+#if (defined(IS_NCCLX) || defined(USE_ROCM)) && defined(NCCL_COMM_DUMP)
+std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+dumpNcclComms() {
+  // Snapshot under the registry lock and dump outside it, as a dump might
+  // hang. Skip communicators being torn down; concurrent dumps share the lock.
+  std::vector<std::pair<std::shared_ptr<LiveComm>, std::string>> entries;
+  {
+    std::lock_guard<std::mutex> lock(liveCommsMutex());
+    for (const auto& [_, entry] : liveComms()) {
+      entries.emplace_back(entry, entry->name);
+    }
+  }
+  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+      dumps;
+  for (const auto& [entry, name] : entries) {
+    std::shared_lock<std::shared_timed_mutex> lock(
+        entry->mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !entry->live) {
+      continue;
+    }
+    std::unordered_map<std::string, std::string> dump;
+    const ncclResult_t result = ::ncclCommDump(entry->comm, dump);
+    if (result != ncclSuccess) {
+      TC_LOG(WARNING) << "ncclCommDump failed for group " << name << ": "
+                      << ncclGetErrorString(result);
+      continue;
+    }
+    dumps[name] = std::move(dump);
+  }
+  return dumps;
+}
+#endif
 
 // Point-to-Point Operations
 c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::sendImpl(

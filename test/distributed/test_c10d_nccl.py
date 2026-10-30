@@ -6403,6 +6403,9 @@ class NCCLTraceTest(NCCLTraceTestBase):
                     str(status["last_completed_collective"]),
                     str(status["last_enqueued_collective"]),
                 )
+            # Present only on NCCLX/ROCm builds with NCCL_COMM_DUMP.
+            if t.get("nccl_comm_state"):
+                self.assertIn(groups["nccl2_pg"][0].group_name, t["nccl_comm_state"])
         for t in [
             pickle.loads(
                 torch._C._distributed_c10d._dump_nccl_trace(includeCollectives=False)

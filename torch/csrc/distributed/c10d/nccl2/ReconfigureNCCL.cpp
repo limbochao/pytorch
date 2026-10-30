@@ -471,6 +471,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCL::reconfigure(
   ncclComm_t oldComm = nullptr;
   if (init_state_ == InitializationState::INITIALIZED) {
     auto workStatus = workq_.garbageCollect();
+    unlistComm();
     if (nccl_comm_ && !revoked_.exchange(true) &&
         (workStatus == WorkNCCL::WorkStatus::NOT_STARTED ||
          workStatus == WorkNCCL::WorkStatus::INPROGRESS)) {

@@ -1245,6 +1245,13 @@ class ProcessGroupNCCL2ShrinkTest(_ProcessGroupNCCL2OptionsTest):
         self.assertEqual(shrunk.size(), 1)
         dist.all_reduce(tensor, group=shrunk)
         self.assertEqual(tensor, torch.ones_like(tensor))
+        # Present only on NCCLX/ROCm builds with NCCL_COMM_DUMP; keyed like
+        # pg_config, so by the renamed child rather than the destroyed parent.
+        trace = pickle.loads(torch._C._distributed_c10d._dump_nccl_trace())
+        comm_state = trace.get("nccl_comm_state")
+        if comm_state:
+            self.assertIn(shrunk.group_name, comm_state)
+            self.assertNotIn(group.group_name, comm_state)
         dist.destroy_process_group(shrunk)
 
 
