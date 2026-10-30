@@ -303,7 +303,7 @@ void ProcessGroupNCCL::init(at::Device device) {
   initNcclResources();
 
   init_state_ = InitializationState::INITIALIZED;
-  TracingGuard tracingGuard(name_, comm_size_, "init", rank_, sequence_number_);
+  TracingGuard tracingGuard(tracingInfo(), "init", rank_, sequence_number_);
 
   TC_LOG(INFO, this) << "ProcessGroupNCCL initialized for rank: " << rank_;
 }
@@ -366,7 +366,7 @@ void ProcessGroupNCCL::initFromComm(
   nccl_comm_ = comm;
   initNcclResources();
   init_state_ = InitializationState::INITIALIZED;
-  TracingGuard tracingGuard(name_, comm_size_, "init", rank_, sequence_number_);
+  TracingGuard tracingGuard(tracingInfo(), "init", rank_, sequence_number_);
   TC_LOG(INFO, this) << "ProcessGroupNCCL initialized from split for rank: "
                      << rank_;
 }
@@ -816,7 +816,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::sendImpl(
   checkTensorDevice(tensor);
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "send", dst, sequence_number_, tensor, tensor);
+      tracingInfo(), "send", dst, sequence_number_, tensor, tensor);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -875,7 +875,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::recvImpl(
   checkTensorDevice(tensor);
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "recv", src, sequence_number_, tensor, tensor);
+      tracingInfo(), "recv", src, sequence_number_, tensor, tensor);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -947,8 +947,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::batch_op_issue(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "batch_op_issue",
       rank_,
       sequence_number_,
@@ -1025,7 +1024,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::broadcastImpl(
   checkTensorDevice(tensor);
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "broadcast", root, sequence_number_, tensor, tensor);
+      tracingInfo(), "broadcast", root, sequence_number_, tensor, tensor);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1070,7 +1069,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_reduce(
   checkTensorDevice(tensor);
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "all_reduce", rank_, sequence_number_, tensor, tensor);
+      tracingInfo(), "allreduce", rank_, sequence_number_, tensor, tensor);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1116,7 +1115,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceImpl(
   checkTensorDevice(tensor);
 
   TracingGuard tracingGuard(
-      name_, comm_size_, "reduce", root, sequence_number_, tensor, tensor);
+      tracingInfo(), "reduce", root, sequence_number_, tensor, tensor);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1200,8 +1199,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_gather(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "all_gather",
       rank_,
       sequence_number_,
@@ -1279,8 +1277,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allGatherFlat(
     const MaterializedCollectiveConfig& native_config,
     std::string_view profiling_title) {
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "all_gather",
       rank_,
       sequence_number_,
@@ -1348,13 +1345,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allGatherSingleImpl(
       "Output tensor size must be input_size * comm_size for allGatherSingleImpl");
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
-      "allGatherSingleImpl",
-      rank_,
-      sequence_number_,
-      input,
-      output);
+      tracingInfo(), "_allgather_base", rank_, sequence_number_, input, output);
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1417,8 +1408,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduce_scatter(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "reduce_scatter",
       rank_,
       sequence_number_,
@@ -1498,8 +1488,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceScatterFlat(
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "reduce_scatter",
       rank_,
       sequence_number_,
@@ -1573,9 +1562,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceScatterSingleImpl(
       "Input tensor size must be output_size * comm_size for reduceScatterSingleImpl");
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
-      "reduceScatterSingleImpl",
+      tracingInfo(),
+      "_reduce_scatter_base",
       rank_,
       sequence_number_,
       input,
@@ -1634,14 +1622,16 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allToAllSingleImpl(
       input.numel() % comm_size_ == 0,
       "Tensor size must be divisible by comm_size for allToAllSingleImpl");
 
+  // Equal split: stock records empty split sizes.
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
-      "allToAllSingleImpl",
+      tracingInfo(),
+      "all_to_allv",
       rank_,
       sequence_number_,
       input,
-      output);
+      output,
+      {},
+      {});
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1748,14 +1738,18 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all_v_single(
       output_total <= static_cast<uint64_t>(output.size(0)),
       "Sum of output_split_sizes exceeds output tensor size for all_to_all_v_single");
 
+  auto toInt64 = [](const std::vector<uint64_t>& v) {
+    return std::vector<int64_t>(v.begin(), v.end());
+  };
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
-      "all_to_all_v_single",
+      tracingInfo(),
+      "all_to_allv",
       rank_,
       sequence_number_,
       input,
-      output);
+      output,
+      toInt64(input_split_sizes),
+      toInt64(output_split_sizes));
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
@@ -1863,8 +1857,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "all_to_all",
       rank_,
       sequence_number_,
@@ -1944,8 +1937,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::barrierImpl(
         at::empty({1}, at::TensorOptions().device(device_).dtype(at::kFloat));
   }
 
-  TracingGuard tracingGuard(
-      name_, comm_size_, "barrier", rank_, sequence_number_);
+  TracingGuard tracingGuard(tracingInfo(), "barrier", rank_, sequence_number_);
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
   auto work = createWork(stream, timeout);
@@ -2007,8 +1999,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::scatterImpl(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
+      tracingInfo(),
       "scatter",
       root,
       sequence_number_,
@@ -2130,9 +2121,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::gatherImpl(
   }
 
   TracingGuard tracingGuard(
-      name_,
-      comm_size_,
-      "gather",
+      tracingInfo(),
+      profiling_title,
       root,
       sequence_number_,
       {input_tensor},
