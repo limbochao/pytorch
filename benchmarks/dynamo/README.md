@@ -78,6 +78,8 @@ For debugging you can run just a single benchmark by adding the `--only=<NAME>` 
 
 For CUDA device kernel timing with the same TorchBench model revision and sampling
 method as the NPU runner, see [CUDA/NPU device performance comparison](torchbench_device_performance.md).
+For a Chinese deployment walkthrough, see
+[CUDA/NPU deployment and test alignment](torchbench_cuda_npu_deployment_zh.md).
 
 A complete list of options can be seen by running each of the runners with the `--help` flag.
 

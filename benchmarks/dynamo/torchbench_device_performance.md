@@ -1,5 +1,8 @@
 # CUDA/NPU TorchBench device performance comparison
 
+中文部署步骤、两端参数对照与结果核对方法见
+[CUDA 环境部署与 NPU 对齐测试指南](torchbench_cuda_npu_deployment_zh.md)。
+
 This test branch starts from PyTorch `v2.13.0`. Use a CUDA-enabled PyTorch 2.13.0
 environment with its matching Triton, torchvision and torchaudio packages.
 Running these Python benchmark scripts does not require rebuilding PyTorch.
