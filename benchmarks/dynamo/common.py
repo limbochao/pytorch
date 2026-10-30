@@ -3586,7 +3586,7 @@ def parse_args(args=None):
     parser.add_argument(
         "--npu-parity",
         action="store_true",
-        help="Match the NPU TorchBench training iteration with plain SGD and disable CUDA TF32",
+        help="Use selected NPU performance batch defaults, align TorchBench training, and disable CUDA TF32",
     )
     parser.add_argument(
         "--profiler-trace-name",
@@ -4294,8 +4294,8 @@ def run(runner, args, original_dir=None):
     runner.args = args
 
     if args.npu_parity:
-        if runner.suite_name != "torchbench":
-            raise ValueError("--npu-parity is supported only by torchbench.py")
+        if runner.suite_name not in ("torchbench", "huggingface", "timm_models"):
+            raise ValueError("--npu-parity requires torchbench.py, huggingface.py or timm_models.py")
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 

@@ -43,7 +43,7 @@ static shapes, and graph capture disabled.
 CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --inference --backend inductor \
-  --float32 --batch-size 2048 --npu-parity --disable-cudagraphs \
+  --float32 --npu-parity --disable-cudagraphs \
   --repeat 30 --enable-profiler 0 --prof-output-path ./profile_cuda_inference \
   --device-perf --output ./dlrm_cuda_inference.csv --output-directory "$PWD"
 
@@ -51,7 +51,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
 CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --training --backend inductor \
-  --float32 --batch-size 1024 --npu-parity --disable-cudagraphs \
+  --float32 --npu-parity --disable-cudagraphs \
   --repeat 30 --enable-profiler 0 --prof-output-path ./profile_cuda_training \
   --device-perf --output ./dlrm_cuda_training.csv --output-directory "$PWD"
 ```
@@ -59,6 +59,24 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
 Use the matching dataset, dtype, input shapes and batch size for other models.
 CUDA uses its own Inductor/Triton implementation; omit NPU-specific arguments
 such as `--npu-backend` and replace `--disable-aclgraph` with `--disable-cudagraphs`.
+
+In performance mode, `--npu-parity` matches NPU default batch sizes **only for
+40 selected models**: 18 HuggingFace, 6 TIMM and 16 TorchBench models.
+See the [model list and batch table](npu_performance_batch_sizes_zh.md).
+The defaults are stored in [npu_batch_sizes.py](npu_batch_sizes.py); other
+models retain their community batch defaults, even with `--npu-parity`.
+
+DLRM defaults to 2048 for inference and 1024 for training, so the commands
+above do not need `--batch-size`. For customizable models, an explicit
+`--batch-size` or batch-size-file value takes precedence. Accuracy mode and
+runs without `--npu-parity` retain community batch selection.
+
+The same profiling and batch-default flags work with `huggingface.py` and
+`timm_models.py`. Their optimizer and model execution policies remain those
+of the community runners; the plain-SGD training alignment below applies to
+TorchBench only. NPU-specific model patches are not generally ported.
+The batch defaults for `soft_actor_critic` are temporarily aligned during
+model construction because that model disallows custom batch sizes.
 
 `--npu-parity` disables CUDA TF32. For training, it matches the NPU runner's
 SGD optimizer (`lr=0.01`, `foreach=False`), allows Dynamo to trace zero-grad and

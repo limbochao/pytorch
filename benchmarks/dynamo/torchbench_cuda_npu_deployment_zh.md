@@ -9,7 +9,8 @@
 ## 1. 固定代码版本与测试配置
 
 CUDA 使用个人 fork 的 `test/cuda-device-perf` 分支，基线为 PyTorch `v2.13.0`，
-功能实现提交为 `a234bc3d88c6fa43b83bc299eb7f0e4dd440097b`。
+profile 功能起始提交为 `a234bc3d88c6fa43b83bc299eb7f0e4dd440097b`；
+本文的默认 batch 同步需使用该分支的最新版本。
 NPU 对照使用 `pytorch_new` 的 `test/cicd_benchmark` 分支，
 参考实现提交为 `9fb9ca72e8cf`，其中包含 `--device-perf` 和固定 10 轮采集功能。
 
@@ -37,8 +38,32 @@ fb14629994956c16d27c7a9940c5f081afbf68dc
 | 端到端测量 | `--repeat 30 --iterations-per-run 1` | 相同 |
 | device 分析开关 | `--enable-profiler 0 --device-perf` | 相同 |
 
-表中的 batch size 专用于本次 DLRM 对照。其他模型应显式填写其 NPU 实测的 batch size，
-并对齐序列长度、图像尺寸等输入配置，不能统一套用 DLRM 的数值。
+表中的 batch size 专用于本次 DLRM 对照。其他模型也需对齐序列长度、图像尺寸等输入配置，
+不能统一套用 DLRM 的数值。如果 NPU 测试手动改变了 batch size，应在 CUDA 中显式匹配。
+
+### 默认 batch size 如何同步
+
+performance 模式启用 `--npu-parity` 后，默认 batch **只对指定的 40 个模型同步**：
+HuggingFace 18 个、TIMM 6 个、TorchBench 16 个。
+完整名单、训练和推理 batch 及三类 runner 示例见
+[选定模型的 NPU performance batch 对照表](npu_performance_batch_sizes_zh.md)。
+
+默认值集中在 [npu_batch_sizes.py](npu_batch_sizes.py)，取自当前 NPU runner 的实际规则，
+包括 HF 除数及 MT5 的固定 batch 4、TIMM 列表、TorchBench 默认值和 NPU batch 补丁。
+清单外模型保持社区默认值，不会一并改为 NPU 默认。
+允许自定义 batch 的模型仍优先使用显式 `--batch-size` 或 batch-size-file 传入值。
+accuracy 模式和不加 `--npu-parity` 的运行也保持原有 batch 选择。
+
+DLRM 默认推理为 **2048**、训练为 **1024**，后文 CUDA 命令不需要手写 batch size。
+这避免了某些 GPU 上 DLRM 被 metadata 改为推理 batch size 1 的情况。
+`soft_actor_critic` 的 NPU 补丁将默认 batch 改为 **32768**，CUDA 也只同步这项 batch 设置，
+不移植该模型的其他 NPU 算子补丁。
+
+NPU 某些模型会强制覆盖显式 batch，例如 MT5、dcgan、lennard_jones 和
+nvidia_deeprecommender。CUDA 对允许自定义 batch 的模型尊重显式设置，
+修改时应核对两端 CSV 的实际 `batch_size`，不能只比较命令参数。
+`llama` 在固定版本中没有训练默认 batch；`cm3leon_generate` 在 NPU 中会把训练请求转为推理，
+不能将其算作有效训练性能。此次默认值同步不扩展模型的训练能力。
 
 ## 2. 准备 CUDA Python 环境
 
@@ -130,7 +155,7 @@ mkdir -p "$cuda_infer_dir"
 CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --inference --backend inductor \
-  --float32 --batch-size 2048 --npu-parity --disable-cudagraphs \
+  --float32 --npu-parity --disable-cudagraphs \
   --repeat 30 --iterations-per-run 1 \
   --enable-profiler 0 --prof-output-path "$cuda_infer_dir/profile" \
   --device-perf --output result.csv --output-directory "$cuda_infer_dir" \
@@ -147,14 +172,14 @@ mkdir -p "$cuda_train_dir"
 CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --training --backend inductor \
-  --float32 --batch-size 1024 --npu-parity --disable-cudagraphs \
+  --float32 --npu-parity --disable-cudagraphs \
   --repeat 30 --iterations-per-run 1 \
   --enable-profiler 0 --prof-output-path "$cuda_train_dir/profile" \
   --device-perf --output result.csv --output-directory "$cuda_train_dir" \
   2>&1 | tee "$cuda_train_dir/run.log"
 ```
 
-`--npu-parity` 用于匹配当前 NPU runner 的训练迭代行为：
+`--npu-parity` 除了同步清单内模型的 performance 默认 batch，还匹配当前 NPU TorchBench runner 的训练迭代行为：
 
 - 使用普通 SGD，学习率为 `0.01`，`foreach=False`。
 - zero-grad 和 optimizer step 不套用社区 runner 原有的禁用编译策略。

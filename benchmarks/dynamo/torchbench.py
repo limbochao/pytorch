@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import gc
 import importlib
 import logging
@@ -12,14 +13,17 @@ from collections import namedtuple
 from functools import cached_property
 from os.path import abspath, exists
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 
 try:
     from .common import BenchmarkRunner, load_yaml_file, main
+    from .npu_batch_sizes import get_npu_batch_size, NPU_BATCH_SIZES
 except ImportError:
     from common import BenchmarkRunner, load_yaml_file, main
+    from npu_batch_sizes import get_npu_batch_size, NPU_BATCH_SIZES
 
 from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
@@ -269,13 +273,18 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         if not hasattr(benchmark_cls, "name"):
             benchmark_cls.name = model_name
 
+        npu_defaults = (
+            self.args.npu_parity and self.args.performance and model_name in NPU_BATCH_SIZES["torchbench"]
+        )
         cant_change_batch_size = (
             not getattr(benchmark_cls, "ALLOW_CUSTOMIZE_BSIZE", True)
             or model_name in self._config["dont_change_batch_size"]
         )
         if cant_change_batch_size:
             batch_size = None
-        if (
+        if npu_defaults:
+            batch_size = get_npu_batch_size(self.args, self.suite_name, model_name, batch_size)
+        elif (
             batch_size is None
             and is_training
             and model_name in self._batch_size["training"]
@@ -304,36 +313,43 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             self.args.amp = True
             self.setup_amp()
 
-        if model_name == "vision_maskrcnn" and is_training:
-            # Output of vision_maskrcnn model is a list of bounding boxes,
-            # sorted on the basis of their scores. This makes accuracy
-            # comparison hard with torch.compile. torch.compile can cause minor
-            # divergences in the output because of how fusion works for amp in
-            # TorchInductor compared to eager.  Therefore, instead of looking at
-            # all the bounding boxes, we compare only top 4.
-            model_kwargs = {"box_detections_per_img": 4}
-            benchmark = benchmark_cls(
-                test="train",
-                device=device,
-                batch_size=batch_size,
-                extra_args=extra_args,
-                model_kwargs=model_kwargs,
+        batch_context = contextlib.nullcontext()
+        if npu_defaults and model_name == "soft_actor_critic":
+            train_batch, eval_batch = NPU_BATCH_SIZES["torchbench"][model_name]
+            batch_context = patch.multiple(
+                benchmark_cls, DEFAULT_TRAIN_BSIZE=train_batch, DEFAULT_EVAL_BSIZE=eval_batch
             )
-            use_eval_mode = True
-        elif is_training:
-            benchmark = benchmark_cls(
-                test="train",
-                device=device,
-                batch_size=batch_size,
-                extra_args=extra_args,
-            )
-        else:
-            benchmark = benchmark_cls(
-                test="eval",
-                device=device,
-                batch_size=batch_size,
-                extra_args=extra_args,
-            )
+        with batch_context:
+            if model_name == "vision_maskrcnn" and is_training:
+                # Output of vision_maskrcnn model is a list of bounding boxes,
+                # sorted on the basis of their scores. This makes accuracy
+                # comparison hard with torch.compile. torch.compile can cause minor
+                # divergences in the output because of how fusion works for amp in
+                # TorchInductor compared to eager.  Therefore, instead of looking at
+                # all the bounding boxes, we compare only top 4.
+                model_kwargs = {"box_detections_per_img": 4}
+                benchmark = benchmark_cls(
+                    test="train",
+                    device=device,
+                    batch_size=batch_size,
+                    extra_args=extra_args,
+                    model_kwargs=model_kwargs,
+                )
+                use_eval_mode = True
+            elif is_training:
+                benchmark = benchmark_cls(
+                    test="train",
+                    device=device,
+                    batch_size=batch_size,
+                    extra_args=extra_args,
+                )
+            else:
+                benchmark = benchmark_cls(
+                    test="eval",
+                    device=device,
+                    batch_size=batch_size,
+                    extra_args=extra_args,
+                )
         model, example_inputs = benchmark.get_module()
         if model_name in [
             "basic_gnn_edgecnn",

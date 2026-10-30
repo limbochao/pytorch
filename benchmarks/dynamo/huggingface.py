@@ -19,6 +19,7 @@ try:
         main,
         reset_rng_state,
     )
+    from .npu_batch_sizes import get_npu_batch_size
 except ImportError:
     from common import (
         BenchmarkRunner,
@@ -27,6 +28,7 @@ except ImportError:
         main,
         reset_rng_state,
     )
+    from npu_batch_sizes import get_npu_batch_size
 
 import torch
 from torch._dynamo.testing import collect_results
@@ -420,6 +422,7 @@ class HuggingfaceRunner(BenchmarkRunner):
         reset_rng_state()
 
         # Get batch size
+        batch_size = get_npu_batch_size(self.args, self.suite_name, model_name, batch_size)
         if model_name in BATCH_SIZE_KNOWN_MODELS:
             batch_size_default = BATCH_SIZE_KNOWN_MODELS[model_name]
         elif batch_size is None:
