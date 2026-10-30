@@ -3642,6 +3642,7 @@ end
                 device_type=device_type,
                 aot_mode=graph.aot_mode,
                 use_relative_path=use_relative_path,
+                extra_flags=graph.wrapper_code.cutedsl_link_args(),
             )
 
             if gpu_kernels_o and device_type == "xpu":
