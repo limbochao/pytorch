@@ -547,12 +547,12 @@ def user_kernel_hop_infos() -> list[UserKernelHOPInfo]:
 
 
 class UserKernelHOPifier:
-    """Base of each DSL's HOPifier (e.g. TritonHOPifier), which turns a call to a user
-    kernel into a call to the DSL's mutation HOP.
+    """Base of each DSL's HOPifier (TritonHOPifier, CuteDSLHOPifier), which turns a
+    call to a user kernel into a call to the DSL's mutation HOP.
 
-    Each DSL has one subclass per capture environment: Dynamo, which works on
-    VariableTrackers and reports unsupported features as graph breaks, and tracing
-    (make_fx, non-strict export), which works on real or fake values.
+    Each DSL has one subclass per capture environment it supports: Dynamo, which
+    works on VariableTrackers and reports unsupported features as graph breaks, and
+    tracing (make_fx, non-strict export), which works on real or fake values.
     """
 
     def raise_unsupported(self, msg: str) -> Never:
