@@ -52,9 +52,22 @@ def main():
         "--output-dir", type=Path,
         help="new or empty results directory, relative to the calling directory",
     )
+    parser.add_argument(
+        "--models", nargs="+", metavar="MODEL",
+        help="space-separated exact model names from the 40-model list; defaults to all models",
+    )
     args = parser.parse_args(sys.argv[2:])
     if not args.device.strip() or "," in args.device or args.device.strip() == "-1":
         parser.error("--device must select exactly one GPU")
+    requested = set(args.models or ())
+    known = {model for models in NPU_BATCH_SIZES.values() for model in models}
+    unknown = requested - known
+    if unknown:
+        parser.error(f"unknown models: {', '.join(sorted(unknown))}; use exact names from the 40-model list")
+    selected = {
+        suite: {model: sizes for model, sizes in models.items() if not requested or model in requested}
+        for suite, models in NPU_BATCH_SIZES.items()
+    }
     output_dir = args.output_dir or Path(f"cuda_device_performance_{datetime.now():%Y%m%d_%H%M%S_%f}")
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
@@ -79,7 +92,7 @@ def main():
         "message", "log_path", "profile_path",
     ]
     counts = {"ok": 0, "failed": 0, "unsupported": 0}
-    total = 2 * sum(len(models) for models in NPU_BATCH_SIZES.values())
+    total = 2 * sum(len(models) for models in selected.values())
     print(f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} (runner device: cuda:0)", flush=True)
     print(f"Summary: {summary_path}", flush=True)
     with summary_path.open("x", newline="") as summary:
@@ -87,7 +100,7 @@ def main():
         writer.writeheader()
         summary.flush()
         order = 0
-        for suite, models in NPU_BATCH_SIZES.items():
+        for suite, models in selected.items():
             for model, (training_batch, inference_batch) in models.items():
                 for mode, batch in (("inference", inference_batch), ("training", training_batch)):
                     order += 1

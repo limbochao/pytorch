@@ -148,6 +148,19 @@ bash benchmarks/dynamo/run_selected_device_performance.sh \
   --device 0 --output-dir ./cuda_device_results
 ```
 
+仅执行部分模型时，使用 `--models`，多个模型名以空格分隔，可以跨测试套选择：
+
+```bash
+bash benchmarks/dynamo/run_selected_device_performance.sh \
+  --device 0 --output-dir ./cuda_device_subset \
+  --models BertForMaskedLM beit_base_patch16_224 dlrm nanogpt
+```
+
+模型名必须与 40 个模型清单中的名称完全一致；无效名称会在启动 CUDA 检查和创建结果目录前报错。
+重复名称只执行一次。筛选后仍按原清单排序，每个模型先推理、后训练，
+`summary.csv` 只包含选中模型的场景，`order` 从 1 开始连续编号。
+省略 `--models` 时执行全部 40 个模型。
+
 `--device` 指定一张物理 GPU，也支持 GPU UUID。省略时使用已有的 `CUDA_VISIBLE_DEVICES`，
 未设置则使用 `0`；不接受多卡列表。脚本将选定的卡映射为进程内的 `cuda:0`，串行执行，
 自动切换到 `benchmarks/dynamo`，因此可从其他目录通过脚本的绝对路径启动。
@@ -169,7 +182,7 @@ export TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1
 未设置 `TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1` 时，单模型 runner 保持默认的证书校验。
 
 执行顺序与 [40 个模型清单](npu_performance_batch_sizes_zh.md) 一致，
-每个模型先推理、后训练，汇总固定保留 **80 行**。
+每个模型先推理、后训练；全量执行保留 **80 行**，筛选 N 个模型时保留 **2 × N 行**。
 模型名单与 batch 默认值共同读取自 `npu_batch_sizes.py`，命令统一使用：
 
 ```text
