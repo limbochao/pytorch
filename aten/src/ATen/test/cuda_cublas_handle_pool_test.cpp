@@ -15,6 +15,7 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Sleep.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/util/env.h>
 #include <rocblas/rocblas.h>
 
 #include <array>
@@ -531,6 +532,85 @@ TEST(CUDABlasHandlePoolTest, PublicHandleFromExitedThreadWaitsForItsStream) {
   }
   expectHandleFromExitedThreadWaitsForItsStream(
       [] { return at::cuda::getCurrentCUDABlasHandle(); });
+}
+
+// With the check in fence mode, a launch on a stream other than the one the
+// handle last used waits for that stream's queued work.
+TEST(CUDABlasHandlePoolTest, LtHandleStreamCheckOrdersCrossStreamLaunch) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  if (c10::utils::get_env("TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS") != "fence") {
+    GTEST_SKIP() << "requires TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS=fence";
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  // The check never dereferences the handle, so any distinct pointer works.
+  int key = 0;
+  const auto handle = reinterpret_cast<cublasLtHandle_t>(&key);
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  at::cuda::checkCublasLtHandleStream(handle, first);
+  at::cuda::CUDAEvent first_done;
+  {
+    c10::cuda::CUDAStreamGuard stream_guard(first);
+    at::cuda::sleep(200'000'000);
+    first_done.record(first);
+  }
+
+  at::cuda::checkCublasLtHandleStream(handle, second);
+  at::cuda::CUDAEvent after_launch;
+  after_launch.record(second);
+
+  // The launch finishes only after the work queued before it.
+  after_launch.synchronize();
+  EXPECT_TRUE(first_done.query());
+}
+
+// The same when the handle last ran on another device, both ways, with one
+// side on that device's default stream.
+TEST(CUDABlasHandlePoolTest, LtHandleStreamCheckOrdersCrossDeviceLaunch) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  if (c10::utils::get_env("TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS") != "fence") {
+    GTEST_SKIP() << "requires TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS=fence";
+  }
+  if (at::cuda::device_count() < 2) {
+    GTEST_SKIP() << "requires two GPUs";
+  }
+  int key = 0;
+  const auto handle = reinterpret_cast<cublasLtHandle_t>(&key);
+  const auto pool_stream =
+      c10::cuda::getStreamFromPool(/*isHighPriority=*/false, 0);
+  const auto default_stream = c10::cuda::getDefaultCUDAStream(1);
+  // The first launch on device 1 can take longer than the sleeps below, so it
+  // happens here.
+  at::cuda::CUDAEvent device1_ready;
+  device1_ready.record(default_stream);
+  device1_ready.synchronize();
+  const auto expect_ordered = [&](c10::cuda::CUDAStream last,
+                                  c10::cuda::CUDAStream next) {
+    at::cuda::CUDAEvent last_done;
+    {
+      c10::cuda::CUDAStreamGuard stream_guard(last);
+      at::cuda::sleep(200'000'000);
+      last_done.record(last);
+    }
+    at::cuda::CUDAGuard device_guard(next.device_index());
+    at::cuda::checkCublasLtHandleStream(handle, next);
+    at::cuda::CUDAEvent after_launch;
+    after_launch.record(next);
+    after_launch.synchronize();
+    EXPECT_TRUE(last_done.query())
+        << "launch on device " << static_cast<int>(next.device_index());
+  };
+  {
+    at::cuda::CUDAGuard device_guard(0);
+    at::cuda::checkCublasLtHandleStream(handle, pool_stream);
+  }
+
+  expect_ordered(pool_stream, default_stream);
+  expect_ordered(default_stream, pool_stream);
 }
 
 #endif // USE_ROCM

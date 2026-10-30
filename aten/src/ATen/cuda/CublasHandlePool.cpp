@@ -11,6 +11,7 @@
 #include <mutex>
 #include <regex>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -21,8 +22,15 @@
 #if defined(USE_ROCM)
 #include <ATen/cuda/MemPool.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/util/Backtrace.h>
+#include <c10/util/Logging.h>
 #include <c10/util/ScopeExit.h>
+#include <c10/util/env.h>
+#include <c10/util/thread_name.h>
 #include <rocblas/rocblas.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 /**
@@ -1005,6 +1013,183 @@ void releaseCaptureCublasWorkspaces(c10::CaptureId_t capture_id) {
             ". Retaining the workspace to keep the handle binding valid.");
       }
     }
+  }
+}
+#endif
+
+#ifdef USE_ROCM
+namespace {
+
+bool streamIsCapturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return true;
+  }
+  return status != cudaStreamCaptureStatusNone;
+}
+
+enum class LtStreamCheck { Off, Warn, Fence };
+
+LtStreamCheck ltStreamCheckMode() {
+  static const LtStreamCheck mode = [] {
+    const auto value =
+        c10::utils::get_env("TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS");
+    if (!value.has_value() || value->empty() || *value == "0") {
+      return LtStreamCheck::Off;
+    }
+    return *value == "fence" ? LtStreamCheck::Fence : LtStreamCheck::Warn;
+  }();
+  return mode;
+}
+
+struct LtLastLaunch {
+  cudaStream_t stream = nullptr;
+  c10::DeviceIndex device = 0;
+  int64_t tid = 0;
+  std::string thread_name;
+  cudaEvent_t fence = nullptr;
+  c10::DeviceIndex fence_device = 0;
+};
+
+struct LtLaunchHistory {
+  std::mutex mutex;
+  std::unordered_map<cublasLtHandle_t, LtLastLaunch> last;
+  // Handovers by the pool, which orders them, are counted apart so that they
+  // cannot use up the reports of unexplained sharing.
+  int64_t handover_reports = 0;
+  int64_t sharing_reports = 0;
+};
+
+LtLaunchHistory& ltLaunchHistory() {
+  static auto& history = *new LtLaunchHistory();
+  return history;
+}
+
+constexpr int64_t kMaxLtStreamReports = 20;
+
+bool threadIsAlive(int64_t tid) {
+  const auto path = "/proc/self/task/" + std::to_string(tid);
+  return ::access(path.c_str(), F_OK) == 0;
+}
+
+// False for a capturing stream, whose capture a query would invalidate.
+bool streamHasQueuedWork(cudaStream_t stream, c10::DeviceIndex device) {
+  c10::cuda::CUDAGuard device_guard(device);
+  if (streamIsCapturing(stream)) {
+    return false;
+  }
+  // Keep another thread's capture from forbidding the query.
+  c10::cuda::CUDAStreamCaptureModeGuard mode_guard(
+      cudaStreamCaptureModeRelaxed);
+  const auto status = cudaStreamQuery(stream);
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+  }
+  return status == cudaErrorNotReady;
+}
+
+// Makes `stream`, on the current device, wait for the work queued so far on
+// the stream of `last`, which may be on another device.
+cudaError_t waitForLastLaunch(LtLastLaunch& last, cudaStream_t stream) {
+  {
+    // Records the event on the device of `last.stream`, which must also be the
+    // device the event was created on.
+    c10::cuda::CUDAGuard device_guard(last.device);
+    if (last.fence != nullptr && last.fence_device != last.device) {
+      if (cudaEventDestroy(last.fence) != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
+      last.fence = nullptr;
+    }
+    if (last.fence == nullptr) {
+      const auto status =
+          cudaEventCreateWithFlags(&last.fence, cudaEventDisableTiming);
+      if (status != cudaSuccess) {
+        last.fence = nullptr;
+        return status;
+      }
+      last.fence_device = last.device;
+    }
+    const auto status = cudaEventRecord(last.fence, last.stream);
+    if (status != cudaSuccess) {
+      return status;
+    }
+  }
+  // Waits from the current device, where a default `stream` resolves to that
+  // device's default stream.
+  return cudaStreamWaitEvent(stream, last.fence, 0);
+}
+
+} // namespace
+
+// The check must not fail the launch it checks, so it clears the CUDA errors
+// it hits and reports them instead of throwing.
+void checkCublasLtHandleStream(cublasLtHandle_t handle, cudaStream_t stream) {
+  const auto mode = ltStreamCheckMode();
+  if (mode == LtStreamCheck::Off) {
+    return;
+  }
+  c10::DeviceIndex device = 0;
+  if (c10::cuda::GetDevice(&device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return;
+  }
+  const auto tid = static_cast<int64_t>(::syscall(SYS_gettid));
+  std::string report;
+  {
+    auto& history = ltLaunchHistory();
+    std::lock_guard<std::mutex> lock(history.mutex);
+    auto [it, first_launch] = history.last.try_emplace(handle);
+    auto& last = it->second;
+    // A captured launch runs only when its graph is replayed.
+    if (!first_launch && last.stream != stream && !streamIsCapturing(stream) &&
+        streamHasQueuedWork(last.stream, last.device)) {
+      // The pool moves a handle to another thread only after its owner exits.
+      const bool handed_over = last.tid != tid && !threadIsAlive(last.tid);
+      const bool fence = mode == LtStreamCheck::Fence && !handed_over;
+      const auto fence_status =
+          fence ? waitForLastLaunch(last, stream) : cudaSuccess;
+      if (fence_status != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
+      auto& reports =
+          handed_over ? history.handover_reports : history.sharing_reports;
+      if (reports++ < kMaxLtStreamReports) {
+        std::ostringstream message;
+        message << "hipBLASLt handle " << handle << " launched on stream "
+                << stream << " (device " << static_cast<int>(device)
+                << ") by thread " << tid << " (" << c10::getThreadName()
+                << ") while stream " << last.stream << " (device "
+                << static_cast<int>(last.device) << "), where thread "
+                << last.tid << " (" << last.thread_name
+                << (handed_over ? ", exited" : "")
+                << ") last launched it, still has queued work. ";
+        if (handed_over) {
+          message << "The pool handed the handle over when that thread exited "
+                     "and orders this stream after that work.";
+        } else {
+          message << "No pool handover explains this; overlapping launches on "
+                     "one handle can hang hipBLASLt split-K GEMMs.";
+        }
+        if (fence && fence_status == cudaSuccess) {
+          message << " Ordered this launch after that work.";
+        } else if (fence) {
+          message << " Could not order this launch after that work: "
+                  << cudaGetErrorString(fence_status) << ".";
+        }
+        report = message.str();
+      }
+    }
+    if (first_launch || last.tid != tid) {
+      last.tid = tid;
+      last.thread_name = c10::getThreadName();
+    }
+    last.stream = stream;
+    last.device = device;
+  }
+  if (!report.empty()) {
+    LOG(WARNING) << report << "\n" << c10::get_backtrace();
   }
 }
 #endif
