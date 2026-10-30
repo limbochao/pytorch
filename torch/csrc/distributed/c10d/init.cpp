@@ -5524,6 +5524,7 @@ every backend of the group records natively.)")
           &::c10d::FlightRecorderHook::attach,
           py::arg("pg"),
           py::arg("global_ranks") = std::vector<uint64_t>{},
+          py::call_guard<py::gil_scoped_release>(),
           R"(
 Attach a FlightRecorder hook to a process group. Collectives issued through
 the group are recorded into the generic flight recorder ring buffer (dump
@@ -5539,7 +5540,16 @@ fabricating 0..size-1, which would collide the dump files of a subgroup.)")
       .def(
           "remove",
           &::c10d::FlightRecorderHook::remove,
-          "Detach the hook from its process group.");
+          "Detach the hook from its process group.")
+      .def_static(
+          "rearm",
+          &::c10d::FlightRecorderHook::rearm,
+          py::call_guard<py::gil_scoped_release>(),
+          R"(
+Allow this process to dump and broadcast the dump signal again after a
+failure it survived. Applies to every hook in the process. Backends that
+reconfigure (nccl2) call it themselves; dump signals sent before the call are
+ignored.)");
 
   py::class_<::c10d::NanCheckHook, std::shared_ptr<::c10d::NanCheckHook>>(
       module,

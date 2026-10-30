@@ -29,6 +29,7 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/PrefixStore.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
+#include <torch/csrc/distributed/c10d/hooks/FlightRecorderHook.hpp>
 #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
 #include <torch/csrc/distributed/c10d/nccl2/NCCLBootstrap.hpp>
 
@@ -569,6 +570,8 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCL::reconfigure(
       " of ",
       newSize);
   reconfigure_uuid_ = opts.uuid;
+  // The failure that led here has been dealt with; dump on the next one.
+  ::c10d::FlightRecorderHook::rearm();
 
   TC_LOG(INFO, this) << "ProcessGroupNCCL reconfigure completed for rank: "
                      << rank_;
