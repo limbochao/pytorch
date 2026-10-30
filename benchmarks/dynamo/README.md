@@ -76,6 +76,9 @@ Each of these scripts takes the same set of arguments.  The ones used by dashboa
 
 For debugging you can run just a single benchmark by adding the `--only=<NAME>` flag.
 
+For CUDA device kernel timing with the same TorchBench model revision and sampling
+method as the NPU runner, see [CUDA/NPU device performance comparison](torchbench_device_performance.md).
+
 A complete list of options can be seen by running each of the runners with the `--help` flag.
 
 As an example, the commands to run first line of the dashboard (performance only) would be:

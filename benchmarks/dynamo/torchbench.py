@@ -11,6 +11,7 @@ import warnings
 from collections import namedtuple
 from functools import cached_property
 from os.path import abspath, exists
+from pathlib import Path
 
 import torch
 
@@ -55,6 +56,7 @@ def setup_torchbench_cwd():
 
     os.environ["KALDI_ROOT"] = tempfile.gettempdir()  # avoids some spam
     for torchbench_dir in (
+        "./benchmark",
         "./torchbenchmark",
         "../torchbenchmark",
         "../torchbench",
@@ -85,6 +87,21 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         super().__init__()
         self.suite_name = "torchbench"
         self.optimizer = None
+
+    def init_optimizer(self, name, device, params):
+        if self.args.npu_parity and device == "cuda" and self.args.training:
+            self.optimizer = torch.optim.SGD(params, lr=0.01, foreach=False)
+        else:
+            super().init_optimizer(name, device, params)
+
+    def optimizer_zero_grad(self, mod):
+        if self.args.npu_parity:
+            if self.optimizer is not None:
+                self.optimizer.zero_grad(True)
+            else:
+                mod.zero_grad(True)
+        else:
+            super().optimizer_zero_grad(mod)
 
     @property
     def _config(self):
@@ -488,12 +505,16 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         self.grad_scaler.scale(loss).backward()
         self.optimizer_step()
         if collect_outputs:
-            return collect_results(mod, None, loss, cloned_inputs)
-        return None
+            return collect_results(mod, pred if self.args.npu_parity else None, loss, cloned_inputs)
+        return loss.item() if self.args.npu_parity else None
 
 
 def torchbench_main():
     original_dir = setup_torchbench_cwd()
+    if data_path := os.environ.get("TORCHBENCH_DATA_PATH"):
+        import torchbenchmark
+
+        torchbenchmark.DATA_PATH = Path(data_path).resolve()
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")
     main(TorchBenchmarkRunner(), original_dir)

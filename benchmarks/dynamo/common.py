@@ -1217,6 +1217,32 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         for k, v in kwargs["dynamo_stats"].items():
             headers.append(k)
             row.append(v)
+    if args.enable_profiler is not None:
+        try:
+            from .device_profile import profile_cuda_model, read_kernel_duration
+        except ImportError:
+            from device_profile import profile_cuda_model, read_kernel_duration
+
+        device_times = []
+        for mode, fn in (("eager", model_iter_fn), ("compile", frozen_model_iter_fn)):
+            reset_rng_state()
+            stance = torch.compiler.set_stance("force_eager") if mode == "eager" else contextlib.nullcontext()
+            with stance:
+                trace_dir, steps = profile_cuda_model(
+                    functools.partial(fn, model, example_inputs, collect_outputs=args.collect_outputs),
+                    save_path=os.path.join(args.prof_output_path, current_name, mode),
+                )
+            print(f"[profile] {mode}: {trace_dir}, captured steps: {steps} (10 warmup steps, then {steps} captured)")
+            if args.device_perf:
+                device_times.append(read_kernel_duration(os.path.join(trace_dir, "trace.json"), steps))
+        if args.device_perf:
+            device_speedup = device_times[0] / device_times[1]
+            headers += ["device_speedup", "eager_device_latency", "compile_device_latency", "device_profile_steps"]
+            row += [device_speedup, *device_times, steps]
+            msg = (
+                f"[device] eager={device_times[0]:.6f} ms/step, "
+                f"compile={device_times[1]:.6f} ms/step, device_speedup={device_speedup:.3f}x"
+            )
     write_outputs(
         output_filename,
         headers,
@@ -3539,6 +3565,30 @@ def parse_args(args=None):
         help="exports trace of kineto profiler",
     )
     parser.add_argument(
+        "--enable-profiler",
+        type=int,
+        nargs="?",
+        default=None,
+        const=0,
+        choices=[0],
+        help="Capture CUDA performance profiles; optional level 0 matches the NPU command line",
+    )
+    parser.add_argument(
+        "--prof-output-path",
+        default="./profile",
+        help="Directory for separate eager and compiled CUDA performance profiles",
+    )
+    parser.add_argument(
+        "--device-perf",
+        action="store_true",
+        help="Report device speedup from CUDA trace kernel durations per captured step",
+    )
+    parser.add_argument(
+        "--npu-parity",
+        action="store_true",
+        help="Match the NPU TorchBench training iteration with plain SGD and disable CUDA TF32",
+    )
+    parser.add_argument(
         "--profiler-trace-name",
         "--profiler_trace_name",
         help="Overwrites exported trace name",
@@ -3894,6 +3944,15 @@ def parse_args(args=None):
         "--inference", action="store_true", help="Performs inference"
     )
     parsed = parser.parse_args(args)
+    if parsed.device_perf and parsed.enable_profiler is None:
+        parser.error("--device-perf requires --performance and --enable-profiler")
+    if parsed.enable_profiler is not None:
+        if not parsed.performance:
+            parser.error("--enable-profiler requires --performance")
+        if parsed.devices and parsed.devices != ["cuda"]:
+            parser.error("--enable-profiler requires a CUDA device")
+        if not (parsed.inductor or parsed.backend == "inductor"):
+            parser.error("--enable-profiler requires --backend inductor or --inductor")
     if parsed.batch_invariant and not parsed.accuracy:
         parser.error("--batch-invariant requires --accuracy")
     if parsed.dashboard and parsed.performance:
@@ -4234,6 +4293,12 @@ def run(runner, args, original_dir=None):
     torch._dynamo.reset()
     runner.args = args
 
+    if args.npu_parity:
+        if runner.suite_name != "torchbench":
+            raise ValueError("--npu-parity is supported only by torchbench.py")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
     args.filter = args.filter or [r"."]
     args.exclude = args.exclude or [r"^$"]
     args.exclude_exact = args.exclude_exact or []
@@ -4368,6 +4433,9 @@ def run(runner, args, original_dir=None):
         else:
             log.warning("torch.cuda.is_available() == False, using CPU")
             args.devices = ["cpu"]
+
+    if args.enable_profiler is not None and (args.devices != ["cuda"] or not torch.cuda.is_available()):
+        raise RuntimeError("--enable-profiler requires an available CUDA device")
 
     if args.devices != ["cpu"] and (HAS_CUDA or HAS_XPU):
         global synchronize
