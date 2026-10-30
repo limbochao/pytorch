@@ -1,8 +1,17 @@
 # Owner(s): ["oncall: distributed"]
 
 
+import importlib.util
 import logging
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import unittest
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 import torch.distributed as dist
@@ -22,21 +31,29 @@ from torch.testing._internal.common_distributed import (
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
     skip_but_pass_in_sandcastle_if,
+    TestCase,
 )
 
 
 log = logging.getLogger(__name__)
 
+_NCCL_EP_HEADER_ENV = (
+    "NCCL_EP_HOME",
+    "NCCL_HOME",
+    "NCCL_EP_JIT_SOURCE_DIR",
+    "NCCL_EP_JIT_BUILD_INCLUDE_DIR",
+)
+
 
 def _nccl_ep_available() -> bool:
-    # The torch._nccl_ep extension is built only with USE_NCCL_EP, and a
-    # USE_SYSTEM_NCCL=ON build additionally needs the nccl4py wheel at runtime.
+    # The torch._nccl_ep extension is built only with USE_NCCL_EP.
     # Actually importing it is the real check: find_spec would only locate the
-    # extension without dlopening it, so it would miss a missing libnccl_ep.so.
+    # extension without loading its native dependencies.
     if not torch.cuda.is_available():
         return False
     try:
@@ -50,8 +67,149 @@ def _nccl_ep_available() -> bool:
 def requires_nccl_ep():
     return skip_but_pass_in_sandcastle_if(
         not _nccl_ep_available(),
-        "Test requires a USE_NCCL_EP build (plus nccl4py for USE_SYSTEM_NCCL=ON)",
+        "Test requires a USE_NCCL_EP build",
     )
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or importlib.util.find_spec("torch._nccl_ep") is None,
+    "Test requires CUDA and a USE_NCCL_EP build",
+)
+@instantiate_parametrized_tests
+class TokenSwitchNCCLLoadingTest(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    def _run_roundtrip(self, script, env):
+        with subprocess.Popen(
+            [
+                sys.executable,
+                script,
+                "TokenSwitchNCCLTest.test_dispatch_combine_roundtrip",
+                "-v",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        ) as process:
+            try:
+                output, _ = process.communicate(timeout=600)
+            finally:
+                # Include workers and any JIT compiler children on timeout.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertEqual(process.returncode, 0, output)
+        self.assertIn("Ran 1 test", output)
+        self.assertNotIn("skipped=", output)
+
+    @parametrize(
+        "header",
+        [
+            "nccl_ep.h",
+            "nccl_ep/common.hpp",
+            "nccl_ep/ep_enums.h",
+            "nccl_ep/device/ht_ep.cuh",
+            "nccl.h",
+            "nccl_device.h",
+            "nccl_device/impl/core__types.h",
+        ],
+    )
+    def test_native_jit_headers(self, header):
+        ep = _import_nccl_ep()
+        home = Path(ep.__file__).resolve().parent / "share" / "nccl_ep"
+        path = home / "include" / header
+        self.assertTrue(path.is_file(), str(path))
+
+    @parametrize("value", [None, "", "/another/nccl/installation"])
+    def test_import_preserves_environment(self, value):
+        env = os.environ.copy()
+        for name in _NCCL_EP_HEADER_ENV:
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
+        script = """
+import os
+from torch.distributed._token_switch import _import_nccl_ep
+
+before = dict(os.environ)
+_import_nccl_ep()
+if dict(os.environ) != before:
+    raise AssertionError("Loading NCCL EP changed the environment")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @skip_if_lt_x_gpu(2)
+    def test_jit_ignores_foreign_header_paths(self):
+        _import_nccl_ep()
+        # EP caches JIT paths per architecture. Use fresh workers and an empty
+        # disk cache so previously compiled kernels cannot hide wrong paths.
+        with TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                **dict.fromkeys(_NCCL_EP_HEADER_ENV, str(Path(tmp) / "foreign")),
+                "NCCL_EP_JIT_CACHE_DIR": str(Path(tmp) / "cache"),
+            }
+            self._run_roundtrip(__file__, env)
+
+    @skip_if_lt_x_gpu(2)
+    def test_jit_cache_invalidates_ep_headers(self):
+        ep_path = Path(_import_nccl_ep().__file__).resolve()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            copied_ep = root / ep_path.name
+            shutil.copy2(ep_path, copied_ep)
+            shutil.copytree(ep_path.parent / "share/nccl_ep", root / "share/nccl_ep")
+            (root / "lib").symlink_to(ep_path.parent / "lib", target_is_directory=True)
+            script = root / "roundtrip.py"
+            # Spawned workers reload this script before importing the test class.
+            script.write_text(f"""
+import importlib.util
+import sys
+
+import torch
+
+spec = importlib.util.spec_from_file_location("torch._nccl_ep", {str(copied_ep)!r})
+if spec is None or spec.loader is None:
+    raise ImportError("Cannot load the copied NCCL EP extension")
+ep = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ep
+spec.loader.exec_module(ep)
+torch._nccl_ep = ep
+sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+from test_token_switch import TokenSwitchNCCLTest
+from torch.testing._internal.common_utils import run_tests
+
+if __name__ == "__main__":
+    run_tests()
+""")
+            cache = root / "cache"
+            env = {**os.environ, "NCCL_EP_JIT_CACHE_DIR": str(cache)}
+            self._run_roundtrip(script, env)
+            cubins = set(cache.rglob("*.cubin"))
+            self.assertTrue(cubins, "The roundtrip did not populate the JIT cache")
+            self._run_roundtrip(script, env)
+            self.assertEqual(set(cache.rglob("*.cubin")), cubins)
+
+            header = root / "share/nccl_ep/include/nccl_ep/common.hpp"
+            header.write_text(
+                header.read_text() + "\n// JIT cache invalidation test.\n"
+            )
+            self._run_roundtrip(script, env)
+            self.assertTrue(
+                set(cache.rglob("*.cubin")) - cubins,
+                "Changing an EP header must invalidate cached kernels",
+            )
 
 
 NUM_TOKENS = 16
@@ -1232,21 +1390,27 @@ class TokenSwitchRoutingDtypeTest(MultiProcContinuousTest):
     def backend_str(cls):
         return "nccl"
 
+    def _get_token_switch(self):
+        cls = type(self)
+        if cls._cached_token_switch is None:
+            pg = dist.distributed_c10d._get_default_group()
+            dist.barrier(pg)
+            cls._cached_token_switch = TokenSwitchNCCL(
+                pg,
+                self.world_size,
+                NUM_TOKENS,
+                self.world_size * NUM_TOKENS,
+                TOKEN_SIZE_BYTES,
+            )
+        return cls._cached_token_switch
+
     @skip_if_lt_x_gpu(2)
     @dtypes(torch.int32, torch.int64)
     @parametrize("layout", ["flat", "expert_major"])
     def test_dispatch_combine_roundtrip(self, device, dtype, layout):
         device = torch.device(torch.device(device).type, self.rank)
         torch.cuda.set_device(device)
-        max_recv_tokens = self.world_size * NUM_TOKENS
-        cls = type(self)
-        if cls._cached_token_switch is None:
-            pg = dist.distributed_c10d._get_default_group()
-            dist.barrier(pg)
-            cls._cached_token_switch = TokenSwitchNCCL(
-                pg, self.world_size, NUM_TOKENS, max_recv_tokens, TOKEN_SIZE_BYTES
-            )
-        ts = cls._cached_token_switch
+        ts = self._get_token_switch()
         topk_idx, topk_weights = _generate_topk(
             self.rank, self.world_size, NUM_TOKENS, TOP_K, device
         )
@@ -1256,7 +1420,7 @@ class TokenSwitchRoutingDtypeTest(MultiProcContinuousTest):
             (NUM_TOKENS, HIDDEN), self.rank + 1, dtype=torch.bfloat16, device=device
         )
         dispatched, weights, indices = ts.dispatch(
-            routing, tokens, topk_weights, max_recv_tokens
+            routing, tokens, topk_weights, ts.max_recv_tokens_per_rank
         )
         src_rank = (self.rank - 1) % self.world_size
         self.assertEqual(dispatched[:NUM_TOKENS], torch.full_like(tokens, src_rank + 1))
@@ -1268,6 +1432,146 @@ class TokenSwitchRoutingDtypeTest(MultiProcContinuousTest):
         combined = ts.combine(routing, dispatched[:NUM_TOKENS].contiguous())
         self.assertEqual(combined, tokens)
         self.assertEqual(topk_idx.dtype, dtype)
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("layout", ["flat", "expert_major"])
+    @parametrize("output_mode", ["allocated", "out", "full_metadata"])
+    def test_dispatch_actual_receive_count(self, device, layout, output_mode):
+        device = torch.device(torch.device(device).type, self.rank)
+        torch.cuda.set_device(device)
+        ts = self._get_token_switch()
+        topk_idx, topk_weights = _generate_topk(
+            self.rank, self.world_size, NUM_TOKENS, TOP_K, device
+        )
+        routing = ts.create_routing(topk_idx, layout=layout)
+        num_recv = routing.handle.get_num_recv_tokens()
+        self.assertEqual(num_recv, NUM_TOKENS)
+        self.assertLess(num_recv, ts.max_recv_tokens_per_rank)
+        tokens = torch.full(
+            (NUM_TOKENS, HIDDEN), self.rank + 1, dtype=torch.bfloat16, device=device
+        )
+        if output_mode == "allocated":
+            tokens.requires_grad_()
+            topk_weights.requires_grad_()
+            outputs = ts.dispatch(routing, tokens, topk_weights, num_recv)
+        else:
+            rows = (
+                ts.max_recv_tokens_per_rank
+                if output_mode == "full_metadata"
+                else num_recv
+            )
+            weights = topk_weights.new_empty(
+                (rows, TOP_K) if layout == "flat" else (rows,)
+            )
+            indices = topk_idx.new_empty(rows, TOP_K) if layout == "flat" else None
+            out = (tokens.new_empty(num_recv, HIDDEN), weights, indices)
+            outputs = ts.dispatch(routing, tokens, topk_weights, out=out)
+            for actual, expected in zip(outputs, out):
+                self.assertIs(actual, expected)
+        dispatched, weights, indices = outputs
+        src_rank = (self.rank - 1) % self.world_size
+        self.assertEqual(dispatched, torch.full_like(tokens, src_rank + 1))
+        self.assertEqual(weights[:num_recv], torch.ones_like(weights[:num_recv]))
+        if layout == "flat":
+            self.assertEqual(indices[:num_recv], torch.zeros_like(topk_idx))
+        else:
+            self.assertIsNone(indices)
+        combined = ts.combine(routing, dispatched)
+        self.assertEqual(combined, tokens)
+        if output_mode == "allocated":
+            (combined.float().sum() + weights.sum()).backward()
+            self.assertEqual(tokens.grad, torch.ones_like(tokens))
+            self.assertEqual(topk_weights.grad, torch.ones_like(topk_weights))
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("layout", ["flat", "expert_major"])
+    def test_redispatch_preserves_receive_slots(self, device, layout):
+        device = torch.device(torch.device(device).type, self.rank)
+        torch.cuda.set_device(device)
+        num_tokens = 512
+        capacity = self.world_size * num_tokens * 2
+        ts = TokenSwitchNCCL(
+            dist.distributed_c10d._get_default_group(),
+            self.world_size * 2,
+            num_tokens,
+            capacity,
+            TOKEN_SIZE_BYTES,
+        )
+        row = torch.arange(num_tokens, device=device)
+        destination = (row + self.rank) % self.world_size
+        topk_idx = torch.stack((destination * 2, destination * 2 + 1), dim=1)
+        topk_weights = torch.stack((row % 16 + 1, row % 16 + 17), dim=1).float() / 32
+        topk_weights.requires_grad_()
+        # Distinct rows across ranks and enough rows for multiple permute blocks.
+        tokens = (row % 128).to(torch.bfloat16)[:, None].expand(-1, HIDDEN).clone()
+        tokens[:, 0] = self.rank
+        tokens[:, 1] = row // 128
+        tokens.requires_grad_()
+        routing = ts.create_routing(topk_idx, layout=layout)
+        num_recv = routing.handle.get_num_recv_tokens()
+        first, first_weights, _ = ts.dispatch(routing, tokens, topk_weights, capacity)
+        for scale in (2, 4, 8):
+            with torch.no_grad():
+                received, weights, _ = ts.dispatch(
+                    routing, tokens * scale, topk_weights * scale, capacity
+                )
+            self.assertEqual(received[:num_recv], first[:num_recv] * scale)
+            self.assertEqual(weights[:num_recv], first_weights[:num_recv] * scale)
+
+        # Reusing Routing must not change how earlier outputs are combined or differentiated.
+        combined = ts.combine(routing, first[:num_recv].contiguous())
+        copies = 2 if layout == "expert_major" else 1
+        self.assertEqual(combined, tokens * copies)
+        loss = (combined.float() * tokens.detach().float()).sum()
+        loss = loss + first_weights[:num_recv].square().sum()
+        loss.backward()
+        self.assertEqual(tokens.grad, tokens.detach() * copies)
+        self.assertEqual(topk_weights.grad, topk_weights.detach() * 2)
+        torch.cuda.synchronize()
+        del loss, combined, first, first_weights, routing
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("layout", ["flat", "expert_major"])
+    def test_dispatch_insufficient_receive_count(self, device, layout):
+        device = torch.device(torch.device(device).type, self.rank)
+        torch.cuda.set_device(device)
+        ts = self._get_token_switch()
+        topk_idx, weights = _generate_topk(
+            self.rank, self.world_size, NUM_TOKENS, TOP_K, device
+        )
+        routing = ts.create_routing(topk_idx, layout=layout)
+        tokens = torch.zeros(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device=device)
+        with self.assertRaisesRegex(ValueError, "rows but receives"):
+            ts.dispatch(routing, tokens, weights, NUM_TOKENS - 1)
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("layout", ["flat", "expert_major"])
+    def test_dispatch_graph_replay(self, device, layout):
+        device = torch.device(torch.device(device).type, self.rank)
+        torch.cuda.set_device(device)
+        ts = self._get_token_switch()
+        topk_idx, weights = _generate_topk(
+            self.rank, self.world_size, NUM_TOKENS, TOP_K, device
+        )
+        routing = ts.create_routing(topk_idx, layout=layout)
+        tokens = torch.zeros(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device=device)
+        out = ts._alloc_dispatch_outputs(
+            routing, tokens, weights, ts.max_recv_tokens_per_rank, HIDDEN, TOP_K
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            ts.dispatch(routing, tokens, weights, out=out)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            ts.dispatch(routing, tokens, weights, out=out)
+        src_rank = (self.rank - 1) % self.world_size
+        for offset in range(1, 4):
+            tokens.fill_(self.rank + offset)
+            graph.replay()
+            expected = torch.full_like(tokens, src_rank + offset)
+            self.assertEqual(out[0][:NUM_TOKENS], expected)
 
 
 instantiate_device_type_tests(TokenSwitchRoutingDtypeTest, globals(), only_for="cuda")
