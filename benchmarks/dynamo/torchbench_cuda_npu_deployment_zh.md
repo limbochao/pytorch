@@ -139,6 +139,72 @@ export TORCHBENCH_DATA_PATH=/absolute/path/to/torchbench_data
 
 ## 4. CUDA 测试命令
 
+### 4.0 一键执行指定的 40 个模型
+
+完成前面的环境部署，并准备好清单中各模型的依赖、权重及数据集后，在 CUDA PyTorch 仓库根目录执行：
+
+```bash
+bash benchmarks/dynamo/run_selected_device_performance.sh \
+  --device 0 --output-dir ./cuda_device_results
+```
+
+`--device` 指定一张物理 GPU，也支持 GPU UUID。省略时使用已有的 `CUDA_VISIBLE_DEVICES`，
+未设置则使用 `0`；不接受多卡列表。脚本将选定的卡映射为进程内的 `cuda:0`，串行执行，
+自动切换到 `benchmarks/dynamo`，因此可从其他目录通过脚本的绝对路径启动。
+默认使用当前环境的 `python`，也可以通过 `PYTHON=/path/to/python` 指定解释器。
+脚本不安装模型依赖；第 3 节的 `install.py dlrm` 只准备 DLRM，并不足以运行全部模型。
+
+执行顺序与 [40 个模型清单](npu_performance_batch_sizes_zh.md) 一致，
+每个模型先推理、后训练，汇总固定保留 **80 行**。
+模型名单与 batch 默认值共同读取自 `npu_batch_sizes.py`，命令统一使用：
+
+```text
+--performance --repeat 1 --iterations 1 --iterations-per-run 1
+--inference 或 --training
+--float32 --device cuda --backend inductor --disable-cudagraphs --npu-parity
+--enable-profiler 0 --device-perf
+```
+
+每个模型、每种模式分别保存日志、原始结果 CSV、可复现命令以及 profile：
+
+```text
+cuda_device_results/
+  summary.csv
+  runs/
+    01_huggingface_AlbertForMaskedLM_inference/
+      command.sh
+      run.log
+      result.csv
+      profile/AlbertForMaskedLM/
+        eager/performance_*/{trace.json,op_statistics.csv}
+        compile/performance_*/{trace.json,op_statistics.csv}
+    02_huggingface_AlbertForMaskedLM_training/
+      ...
+```
+
+`--output-dir` 相对于启动命令所在目录，必须不存在或为空，以免混入旧结果；
+省略时在启动目录创建带时间戳的结果目录。`summary.csv` 每完成一个场景就追加一行，字段包括：
+
+| 字段 | 含义 |
+| --- | --- |
+| `order`、`suite`、`model`、`mode` | 原始顺序、测试套、模型名及推理/训练模式 |
+| `batch_size` | 成功运行实际使用的 batch size，核对 NPU 默认值 |
+| `eager_device_ms_per_step` | eager 单步 kernel 累计耗时，毫秒 |
+| `inductor_device_ms_per_step` | Inductor 单步 kernel 累计耗时，毫秒 |
+| `device_speedup` | eager device 耗时 / Inductor device 耗时 |
+| `profile_steps` | 每种模式实际采集轮数，应为 10 |
+| `status`、`exit_code`、`message` | `ok`、`failed` 或 `unsupported`，以及退出码和原因 |
+| `log_path`、`profile_path` | 该场景的日志和 profile 绝对路径 |
+
+汇总只读取原始 CSV 的 `eager_device_latency`、`compile_device_latency`、`device_speedup`，
+不使用端到端列；采样仍为每种模式预热 10 轮、采集 10 轮。
+`llama` 和 `cm3leon_generate` 的训练标记为 `unsupported`，不启动 runner，耗时留空。
+其他场景失败时标记为 `failed` 并继续后续模型，耗时留空，不能当作 0 ms 或有效加速比。
+即使 runner 返回 0，缺少有效 device 结果、采样轮数或 batch 不匹配也会标记失败。
+全部结束后如有 `failed`，脚本返回 1；只有 `ok` 和上述预期的 `unsupported` 时返回 0。
+
+### 单模型命令
+
 下面两组命令均在 `pytorch_cuda/benchmarks/dynamo` 执行。
 `CUDA_VISIBLE_DEVICES=0` 是示例，替换为已确认空闲的 GPU。
 结果目录使用绝对路径，分别保存推理和训练产物，避免相对路径或旧 profile 干扰核对。
