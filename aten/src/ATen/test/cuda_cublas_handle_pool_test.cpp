@@ -14,6 +14,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Sleep.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <rocblas/rocblas.h>
 
 #include <array>
@@ -415,6 +416,121 @@ TEST(CUDABlasHandlePoolTest, CaptureHandleKeepsPointerModePerStream) {
   EXPECT_EQ(mode(at::cuda::getCurrentCUDABlasHandle()), rocblas_pointer_mode_device);
   EXPECT_EQ(rocblas_set_pointer_mode(h1, rocblas_pointer_mode_host), rocblas_status_success);
   graph.capture_end();
+}
+
+// An exiting thread returns its stream-keyed handles while work it queued may
+// still be running, and such a handle cannot serve two streams at once, so the
+// stream that takes it next must wait for that work.
+template <typename GetHandle>
+void expectHandleFromExitedThreadWaitsForItsStream(GetHandle get_handle) {
+  at::cuda::CUDAGuard device_guard(0);
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  decltype(get_handle()) returned = nullptr;
+  at::cuda::CUDAEvent owner_done;
+  std::thread owner([&] {
+    at::cuda::CUDAGuard guard(0);
+    c10::cuda::CUDAStreamGuard stream_guard(first);
+    returned = get_handle();
+    // Stands in for work still queued when the thread exits.
+    at::cuda::sleep(200'000'000);
+    owner_done.record(first);
+  });
+  owner.join();
+
+  decltype(get_handle()) reused = nullptr;
+  at::cuda::CUDAEvent after_reuse;
+  std::thread next_owner([&] {
+    at::cuda::CUDAGuard guard(0);
+    c10::cuda::CUDAStreamGuard stream_guard(second);
+    reused = get_handle();
+    after_reuse.record(second);
+  });
+  next_owner.join();
+
+  // The pool hands out the handle returned last.
+  ASSERT_EQ(reused, returned);
+  // The reuse finishes only after the exited thread's work.
+  after_reuse.synchronize();
+  EXPECT_TRUE(owner_done.query());
+}
+
+// A hipBLASLt handle owns the synchronizer its split-K kernels spin on.
+TEST(CUDABlasHandlePoolTest, LtHandleFromExitedThreadWaitsForItsStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  expectHandleFromExitedThreadWaitsForItsStream(
+      [] { return at::cuda::getCurrentCUDABlasLtHandle(); });
+}
+
+// A thread that first needs a handle mid-capture, like an autograd worker in
+// backward, takes one from the pool on a capturing stream. That stream cannot
+// wait on work outside its capture, and its kernels run whenever the graph is
+// replayed, so the host waits for the exited thread's work instead. The capture
+// begins directly because CUDAGraph::capture_begin() reserves a handle for the
+// capturing thread before capture starts.
+TEST(CUDABlasHandlePoolTest, LtHandleFromExitedThreadWaitsForItsStreamUnderCapture) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  cublasLtHandle_t returned = nullptr;
+  at::cuda::CUDAEvent owner_done;
+  std::thread owner([&] {
+    at::cuda::CUDAGuard guard(0);
+    c10::cuda::CUDAStreamGuard stream_guard(first);
+    returned = at::cuda::getCurrentCUDABlasLtHandle();
+    at::cuda::sleep(200'000'000);
+    owner_done.record(first);
+  });
+  owner.join();
+
+  ASSERT_EQ(
+      cudaStreamBeginCapture(second, cudaStreamCaptureModeGlobal), cudaSuccess);
+  cublasLtHandle_t reused = nullptr;
+  bool owner_done_at_reuse = false;
+  std::exception_ptr failure;
+  std::thread worker([&] {
+    try {
+      at::cuda::CUDAGuard guard(0);
+      c10::cuda::CUDAStreamGuard stream_guard(second);
+      reused = at::cuda::getCurrentCUDABlasLtHandle();
+      // Global capture mode forbids querying an event outside the capture.
+      c10::cuda::CUDAStreamCaptureModeGuard mode_guard(
+          cudaStreamCaptureModeRelaxed);
+      owner_done_at_reuse = owner_done.query();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+  worker.join();
+  cudaGraph_t graph = nullptr;
+  const auto end_status = cudaStreamEndCapture(second, &graph);
+  if (graph != nullptr) {
+    (void)cudaGraphDestroy(graph);
+  }
+
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+  EXPECT_EQ(end_status, cudaSuccess) << cudaGetErrorString(end_status);
+  ASSERT_EQ(reused, returned);
+  EXPECT_TRUE(owner_done_at_reuse);
+}
+
+// A public rocBLAS handle keeps the workspace bound at its creation.
+TEST(CUDABlasHandlePoolTest, PublicHandleFromExitedThreadWaitsForItsStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  if (at::cuda::isCUDABlasWorkspaceCachingEnabled()) {
+    GTEST_SKIP() << "requires eager workspaces";
+  }
+  expectHandleFromExitedThreadWaitsForItsStream(
+      [] { return at::cuda::getCurrentCUDABlasHandle(); });
 }
 
 #endif // USE_ROCM
