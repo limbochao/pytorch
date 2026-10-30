@@ -191,10 +191,7 @@ class TestCppWrapperCustomOps(InductorTestCase):
     @unittest.skipIf(not HAS_CPU, "requires CPU")
     @config.patch(cpp_wrapper=True, implicit_fallbacks=True)
     def test_cpp_wrapper_single_element_tensor_list_return(self):
-        # A Tensor[]-returning op goes through the Python custom_op_wrapper
-        # fallback, which always returns a Python list. A single-element result
-        # must be unwrapped with PyList_GET_ITEM, not as a bare capsule (which
-        # yields a null handle and segfaults downstream).
+        # Even a single-element Tensor[] return occupies a list-valued dispatcher slot.
         with torch.library._scoped_library("mylib_single_list", "FRAGMENT") as m:
             m.define("single_list(Tensor x) -> Tensor[]")
             m.impl("single_list", lambda x: [x + 1], "CPU")
@@ -208,8 +205,10 @@ class TestCppWrapperCustomOps(InductorTestCase):
             out, code = run_and_get_code(torch.compile(fn, fullgraph=True), x)
             self.assertEqual(out, (x + 1) * 2)
             code_str = "\n".join(code)
-            self.assertIn("custom_op_wrapper", code_str)
-            self.assertIn("PyList_GET_ITEM", code_str)
+            self.assertIn(".callBoxed(", code_str)
+            self.assertIn(".toTensorList()", code_str)
+            self.assertNotIn("custom_op_wrapper", code_str)
+            self.assertNotIn("PyObject_CallObject", code_str)
 
 
 if __name__ == "__main__":
