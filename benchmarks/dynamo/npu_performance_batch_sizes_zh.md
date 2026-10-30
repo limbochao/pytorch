@@ -90,21 +90,21 @@ NPU 直接使用其 `timm_models_list.txt` 中的 batch，不套用 CUDA 社区�
 ```bash
 CUDA_VISIBLE_DEVICES=0 python huggingface.py \
   --only AlbertForMaskedLM --device cuda \
-  --performance --training --backend inductor \
+  --performance --training --backend inductor --repeat 1 \
   --float32 --npu-parity --disable-cudagraphs \
   --enable-profiler 0 --device-perf --prof-output-path "$PWD/profile_hf_train" \
   --output hf_train.csv --output-directory "$PWD"
 
 CUDA_VISIBLE_DEVICES=0 python timm_models.py \
   --only beit_base_patch16_224 --device cuda \
-  --performance --training --backend inductor \
+  --performance --training --backend inductor --repeat 1 \
   --float32 --npu-parity --disable-cudagraphs \
   --enable-profiler 0 --device-perf --prof-output-path "$PWD/profile_timm_train" \
   --output timm_train.csv --output-directory "$PWD"
 
 CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --only dlrm --device cuda \
-  --performance --training --backend inductor \
+  --performance --training --backend inductor --repeat 1 \
   --float32 --npu-parity --disable-cudagraphs \
   --enable-profiler 0 --device-perf --prof-output-path "$PWD/profile_tb_train" \
   --output tb_train.csv --output-directory "$PWD"
@@ -114,6 +114,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
 其他模型替换 `--only` 的名称，runner 仍按所属 suite 选择。
 HF 和 TIMM 需要先安装与 NPU 测试一致的 transformers、timm 等模型依赖。
 profile 仍为 eager、compile 各预热 10 轮、采集 10 轮。
+命令中的 `--repeat 1` 只将端到端测量设为一组，不改变 profile 采样轮次。
 
 允许自定义 batch 的模型仍可显式传入 `--batch-size` 或 batch-size-file 覆盖默认值。
 不支持自定义 batch 的 TorchBench 模型保留原有限制。

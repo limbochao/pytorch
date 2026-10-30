@@ -35,7 +35,7 @@ fb14629994956c16d27c7a9940c5f081afbf68dc
 | 输入形状 | 静态，不加动态 shape 参数 | 相同，且实际 shape、stride 和输入配置应匹配 |
 | 训练优化器 | SGD，`lr=0.01`，`foreach=False` | 通过 `--npu-parity` 对齐 |
 | profile 采样 | 每种模式预热 10 轮，再采集 10 轮 | 相同 |
-| 端到端测量 | `--repeat 30 --iterations-per-run 1` | 相同 |
+| 端到端测量 | `--repeat 1 --iterations-per-run 1` | 相同 |
 | device 分析开关 | `--enable-profiler 0 --device-perf` | 相同 |
 
 表中的 batch size 专用于本次 DLRM 对照。其他模型也需对齐序列长度、图像尺寸等输入配置，
@@ -110,9 +110,7 @@ runner 基线和安装包版本是两项信息，都需要保留。
 git clone --branch test/cuda-device-perf --single-branch \
   https://github.com/limbochao/pytorch.git pytorch_cuda
 cd pytorch_cuda
-git fetch origin tag v2.13.0
 git log -1 --oneline
-git merge-base HEAD v2.13.0
 
 cd benchmarks/dynamo
 git clone --depth=1 https://github.com/pytorch/benchmark.git benchmark
@@ -124,8 +122,8 @@ python -m pip install numpy pandas psutil pyyaml scipy tqdm
 python benchmark/install.py dlrm
 ```
 
-`git merge-base` 的预期结果为 `cf30153c4c131c8164ee7798e5022d810682e2cb`，
-即本次 `v2.13.0` 基线；benchmark 的 `rev-parse HEAD` 必须与固定提交一致。
+部署时无需重新获取 PyTorch tag 或检查分支共同祖先；使用上述测试分支即可。
+benchmark 的 `rev-parse HEAD` 必须与固定提交一致。
 模型依赖安装后，再执行上一节的包版本检查，并用 `python -m pip freeze` 保留依赖清单。
 
 运行入口是当前目录下的 `torchbench.py`，不要换成 benchmark 仓库自己的模型运行入口。
@@ -156,7 +154,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --inference --backend inductor \
   --float32 --npu-parity --disable-cudagraphs \
-  --repeat 30 --iterations-per-run 1 \
+  --repeat 1 --iterations-per-run 1 \
   --enable-profiler 0 --prof-output-path "$cuda_infer_dir/profile" \
   --device-perf --output result.csv --output-directory "$cuda_infer_dir" \
   2>&1 | tee "$cuda_infer_dir/run.log"
@@ -173,7 +171,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --training --backend inductor \
   --float32 --npu-parity --disable-cudagraphs \
-  --repeat 30 --iterations-per-run 1 \
+  --repeat 1 --iterations-per-run 1 \
   --enable-profiler 0 --prof-output-path "$cuda_train_dir/profile" \
   --device-perf --output result.csv --output-directory "$cuda_train_dir" \
   2>&1 | tee "$cuda_train_dir/run.log"
@@ -206,7 +204,7 @@ python torchbench.py \
   --performance --inference --backend inductor \
   --npu-backend triton --disable-aclgraph \
   --float32 --batch-size 2048 \
-  --repeat 30 --iterations-per-run 1 \
+  --repeat 1 --iterations-per-run 1 \
   --enable-profiler 0 --prof-output-path "$npu_infer_dir/profile" \
   --device-perf --output result.csv --output-directory "$npu_infer_dir" \
   2>&1 | tee "$npu_infer_dir/run.log"
@@ -219,6 +217,9 @@ CUDA 命令不加 `--npu-backend`，也不使用 `--disable-aclgraph`。
 ## 6. 采集轮次和耗时公式
 
 两端都先完成原有的端到端性能测量，再分别额外执行 eager 和 compile 的 profile：
+
+文档命令使用 `--repeat 1 --iterations-per-run 1`，端到端部分只做一组 eager/compile 计时。
+不能直接省略 `--repeat`，否则 runner 会使用默认的 30 组计时；profile 的 10 轮采集独立控制。
 
 ```text
 每种模式：第 1～10 轮预热，第 11～20 轮正式采集

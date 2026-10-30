@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --inference --backend inductor \
   --float32 --npu-parity --disable-cudagraphs \
-  --repeat 30 --enable-profiler 0 --prof-output-path ./profile_cuda_inference \
+  --repeat 1 --enable-profiler 0 --prof-output-path ./profile_cuda_inference \
   --device-perf --output ./dlrm_cuda_inference.csv --output-directory "$PWD"
 
 # Training
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 python torchbench.py \
   --device cuda --only dlrm \
   --performance --training --backend inductor \
   --float32 --npu-parity --disable-cudagraphs \
-  --repeat 30 --enable-profiler 0 --prof-output-path ./profile_cuda_training \
+  --repeat 1 --enable-profiler 0 --prof-output-path ./profile_cuda_training \
   --device-perf --output ./dlrm_cuda_training.csv --output-directory "$PWD"
 ```
 
@@ -90,6 +90,10 @@ Device-specific NPU patches and CPU fallbacks are not reproduced on CUDA.
 existing end-to-end benchmark. Its optional value is `0` for command-line
 compatibility with the NPU test. It requires CUDA performance mode and Inductor.
 `--device-perf` additionally analyzes the captured traces.
+
+The commands use `--repeat 1` for one eager/compile end-to-end timing pair.
+Omitting the flag would use the runner default of 30 timing pairs.
+This does not change the separate profile sampling below.
 
 Each mode executes **10 warmup steps followed by 10 captured steps**. The
 schedule is fixed, independent of `--repeat`, `--iterations` and
