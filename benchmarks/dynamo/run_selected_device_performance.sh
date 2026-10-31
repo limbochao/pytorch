@@ -7,6 +7,7 @@ import csv
 import math
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -39,6 +40,15 @@ def read_result(path, model, expected_batch):
     }
 
 
+def write_summary(path, columns, rows):
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="run_selected_device_performance.sh",
@@ -50,7 +60,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir", type=Path,
-        help="new or empty results directory, relative to the calling directory",
+        help="results directory; reuse it to retry failed or unfinished cases",
     )
     parser.add_argument(
         "--models", nargs="+", metavar="MODEL",
@@ -70,101 +80,138 @@ def main():
     }
     output_dir = args.output_dir or Path(f"cuda_device_performance_{datetime.now():%Y%m%d_%H%M%S_%f}")
     output_dir = output_dir.expanduser().resolve()
-    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
-        parser.error(f"results directory must be new or empty: {output_dir}")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.device.strip(), PYTHONUNBUFFERED="1")
-    preflight = subprocess.run(
-        [sys.executable, "-c", (
-            "import torch; "
-            "assert torch.cuda.is_available(), 'CUDA is unavailable'; "
-            "assert torch.cuda.device_count() == 1, 'Expected exactly one visible CUDA GPU'; "
-            "print('PyTorch:', torch.__version__, 'GPU:', torch.cuda.get_device_name(0), flush=True)"
-        )],
-        cwd=runner_dir, env=env, check=False,
-    )
-    if preflight.returncode:
-        return preflight.returncode
-    output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "summary.csv"
     columns = [
         "order", "suite", "model", "mode", "batch_size", "eager_device_ms_per_step",
         "inductor_device_ms_per_step", "device_speedup", "profile_steps", "status", "exit_code",
         "message", "log_path", "profile_path",
     ]
+    rows = []
+    for suite, models in selected.items():
+        for model in models:
+            for mode in ("inference", "training"):
+                order = len(rows) + 1
+                run_dir = output_dir / "runs" / f"{order:02d}_{suite}_{model}_{mode}"
+                result = dict.fromkeys(columns, "")
+                result.update(
+                    order=order, suite=suite, model=model, mode=mode, status="pending",
+                    log_path=str(run_dir / "run.log"), profile_path=str(run_dir / "profile"),
+                )
+                rows.append(result)
+    if output_dir.exists() and not output_dir.is_dir():
+        parser.error(f"results path must be a directory: {output_dir}")
+    if summary_path.exists():
+        try:
+            with summary_path.open(newline="") as stream:
+                reader = csv.DictReader(stream)
+                previous = list(reader)
+                if reader.fieldnames != columns:
+                    raise ValueError("unexpected summary columns")
+            keys = ("order", "suite", "model", "mode")
+            expected = [tuple(str(row[key]) for key in keys) for row in rows]
+            saved = [tuple(row[key] for key in keys) for row in previous]
+            if saved != expected[:len(saved)]:
+                raise ValueError("model selection differs from the saved summary; reuse the original --models")
+            for row, saved_row in zip(rows, previous):
+                if None in saved_row or any(value is None for value in saved_row.values()):
+                    raise ValueError("incomplete summary row")
+                if saved_row["status"] not in {"ok", "failed", "unsupported", "pending"}:
+                    raise ValueError("unknown saved status")
+                row.update(saved_row)
+        except (OSError, ValueError, KeyError, csv.Error) as error:
+            parser.error(f"cannot resume {summary_path}: {error}")
+    elif output_dir.exists() and any(path.name != "summary.tmp" for path in output_dir.iterdir()):
+        parser.error(f"nonempty results directory has no summary.csv: {output_dir}")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.device.strip(), PYTHONUNBUFFERED="1")
+    if any(row["status"] not in {"ok", "unsupported"} for row in rows):
+        preflight = subprocess.run(
+            [sys.executable, "-c", (
+                "import torch; "
+                "assert torch.cuda.is_available(), 'CUDA is unavailable'; "
+                "assert torch.cuda.device_count() == 1, 'Expected exactly one visible CUDA GPU'; "
+                "print('PyTorch:', torch.__version__, 'GPU:', torch.cuda.get_device_name(0), flush=True)"
+            )],
+            cwd=runner_dir, env=env, check=False,
+        )
+        if preflight.returncode:
+            return preflight.returncode
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_summary(summary_path, columns, rows)
     counts = {"ok": 0, "failed": 0, "unsupported": 0}
-    total = 2 * sum(len(models) for models in selected.values())
     print(f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} (runner device: cuda:0)", flush=True)
     print(f"Summary: {summary_path}", flush=True)
-    with summary_path.open("x", newline="") as summary:
-        writer = csv.DictWriter(summary, fieldnames=columns)
-        writer.writeheader()
-        summary.flush()
-        order = 0
-        for suite, models in selected.items():
-            for model, (training_batch, inference_batch) in models.items():
-                for mode, batch in (("inference", inference_batch), ("training", training_batch)):
-                    order += 1
-                    run_dir = output_dir / "runs" / f"{order:02d}_{suite}_{model}_{mode}"
-                    run_dir.mkdir(parents=True)
-                    log_path = run_dir / "run.log"
-                    profile_path = run_dir / "profile"
-                    result = dict(
-                        order=order, suite=suite, model=model, mode=mode, status="unsupported",
-                        message="", log_path=str(log_path), profile_path=str(profile_path),
-                    )
-                    print(f"\n[{order}/{total}] {suite}/{model} {mode}", flush=True)
-                    if mode == "training" and (batch is None or model == "cm3leon_generate"):
-                        result["message"] = (
-                            "No training default in the pinned benchmark" if batch is None
-                            else "Inference-only model; NPU converts training requests to inference"
-                        )
-                        log_path.write_text(result["message"] + "\n")
-                        print(f"unsupported: {result['message']}", flush=True)
-                    else:
-                        overrides = {"CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"]}
-                        if suite == "timm_models":
-                            overrides.update(
-                                HF_ENDPOINT="https://hf-mirror.com", TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1",
-                            )
-                        run_env = dict(env, **overrides)
-                        command = [
-                            sys.executable, "-u", str(runner_dir / f"{suite}.py"),
-                            "--performance", "--repeat", "1", "--iterations", "1", "--iterations-per-run", "1",
-                            f"--{mode}", "--float32", "--device", "cuda", "--backend", "inductor",
-                            "--disable-cudagraphs", "--npu-parity", "--only", model,
-                            "--enable-profiler", "0", "--prof-output-path", str(profile_path), "--device-perf",
-                            "--output", "result.csv", "--output-directory", str(run_dir),
-                        ]
-                        (run_dir / "command.sh").write_text(
-                            "".join(f"export {key}={shlex.quote(value)}\n" for key, value in overrides.items())
-                            + f"cd {shlex.quote(str(runner_dir))}\n{shlex.join(command)}\n"
-                        )
-                        with log_path.open("w") as log:
-                            with subprocess.Popen(
-                                command, cwd=runner_dir, env=run_env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors="replace",
-                            ) as process:
-                                try:
-                                    for line in process.stdout:
-                                        log.write(line)
-                                        log.flush()
-                                        print(line, end="", flush=True)
-                                    returncode = process.wait()
-                                except KeyboardInterrupt:
-                                    process.terminate()
-                                    raise
-                        result.update(status="failed", exit_code=returncode)
-                        if returncode:
-                            result["message"] = f"runner exited with code {returncode}; see run.log"
-                        else:
-                            try:
-                                result.update(read_result(run_dir / "result.csv", model, batch), status="ok")
-                            except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
-                                result["message"] = f"invalid device result: {error}; see run.log"
-                        print(f"status: {result['status']} {result['message']}", flush=True)
-                    writer.writerow(result)
-                    summary.flush()
-                    counts[result["status"]] += 1
+    for result in rows:
+        order, suite, model, mode = (result[key] for key in ("order", "suite", "model", "mode"))
+        print(f"\n[{order}/{len(rows)}] {suite}/{model} {mode}", flush=True)
+        if result["status"] in {"ok", "unsupported"}:
+            print(f"skip: saved {result['status']}", flush=True)
+            counts[result["status"]] += 1
+            continue
+        run_dir = output_dir / "runs" / f"{int(order):02d}_{suite}_{model}_{mode}"
+        log_path = run_dir / "run.log"
+        profile_path = run_dir / "profile"
+        result.update(dict.fromkeys((
+            "batch_size", "eager_device_ms_per_step", "inductor_device_ms_per_step", "device_speedup",
+            "profile_steps", "exit_code", "message",
+        ), ""))
+        result.update(status="pending", log_path=str(log_path), profile_path=str(profile_path))
+        write_summary(summary_path, columns, rows)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for stale in run_dir.glob("result*"):
+            if stale.is_file():
+                stale.unlink()
+        if profile_path.exists():
+            shutil.rmtree(profile_path)
+        batch = selected[suite][model][0 if mode == "training" else 1]
+        if mode == "training" and (batch is None or model == "cm3leon_generate"):
+            result.update(status="unsupported", message=(
+                "No training default in the pinned benchmark" if batch is None
+                else "Inference-only model; NPU converts training requests to inference"
+            ))
+            log_path.write_text(result["message"] + "\n")
+            print(f"unsupported: {result['message']}", flush=True)
+        else:
+            overrides = {"CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"]}
+            if suite == "timm_models":
+                overrides.update(HF_ENDPOINT="https://hf-mirror.com", TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1")
+            run_env = dict(env, **overrides)
+            command = [
+                sys.executable, "-u", str(runner_dir / f"{suite}.py"),
+                "--performance", "--repeat", "1", "--iterations", "1", "--iterations-per-run", "1",
+                f"--{mode}", "--float32", "--device", "cuda", "--backend", "inductor",
+                "--disable-cudagraphs", "--npu-parity", "--only", model,
+                "--enable-profiler", "0", "--prof-output-path", str(profile_path), "--device-perf",
+                "--output", "result.csv", "--output-directory", str(run_dir),
+            ]
+            (run_dir / "command.sh").write_text(
+                "".join(f"export {key}={shlex.quote(value)}\n" for key, value in overrides.items())
+                + f"cd {shlex.quote(str(runner_dir))}\n{shlex.join(command)}\n"
+            )
+            with log_path.open("w") as log:
+                with subprocess.Popen(
+                    command, cwd=runner_dir, env=run_env, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, errors="replace",
+                ) as process:
+                    try:
+                        for line in process.stdout:
+                            log.write(line)
+                            log.flush()
+                            print(line, end="", flush=True)
+                        returncode = process.wait()
+                    except KeyboardInterrupt:
+                        process.terminate()
+                        raise
+            result.update(status="failed", exit_code=returncode)
+            if returncode:
+                result["message"] = f"runner exited with code {returncode}; see run.log"
+            else:
+                try:
+                    result.update(read_result(run_dir / "result.csv", model, batch), status="ok")
+                except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
+                    result["message"] = f"invalid device result: {error}; see run.log"
+            print(f"status: {result['status']} {result['message']}", flush=True)
+        write_summary(summary_path, columns, rows)
+        counts[result["status"]] += 1
     print(f"\nFinished: {counts}; summary: {summary_path}", flush=True)
     return int(counts["failed"] > 0)
 

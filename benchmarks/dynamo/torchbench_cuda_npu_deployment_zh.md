@@ -209,8 +209,29 @@ cuda_device_results/
       ...
 ```
 
-`--output-dir` 相对于启动命令所在目录，必须不存在或为空，以免混入旧结果；
-省略时在启动目录创建带时间戳的结果目录。`summary.csv` 每完成一个场景就追加一行，字段包括：
+`--output-dir` 相对于启动命令所在目录。首次运行可指定新目录或空目录，
+省略时在启动目录创建带时间戳的结果目录。
+
+**失败后再次执行原命令，并保持同一个 `--output-dir`，即可自动重试，无需额外参数。**
+脚本读取已有的 `summary.csv`，按模型及推理/训练模式分别判断：
+
+- `ok`：保留已有耗时、日志和 profile，跳过执行。
+- `unsupported`：保留不支持记录，跳过执行。
+- `failed` 或 `pending`：重新执行；中断前尚未记录的场景也会补跑。
+
+例如推理已经成功、训练失败，再次启动只会重试该模型的训练。
+每次启动对待重试的场景各执行一次；仍失败则保留 `failed`，下次原命令可继续重试。
+重试会清理该场景的旧 `result*` 文件和 profile，并覆盖日志及运行命令；
+成功后原位更新耗时、加速比、退出码和状态，其他已成功场景保持不变。
+全部场景已成功或不支持时，再次执行会直接跳过，不启动模型或 CUDA 检查。
+
+重试时保持原来的模型选择、设备和测试配置；更换这些配置时使用新的输出目录。
+已有非空目录必须包含格式正确且模型顺序匹配的 `summary.csv`，避免误用其他测试产物。
+summary 在启动时列出本次计划的全部场景，未完成的状态为 `pending`；
+每完成一个场景就通过临时文件替换来刷新对应行，保留原始顺序，不会追加重复行。
+因此 Ctrl+C 中断后仍可复用同一命令继续执行。
+
+`summary.csv` 字段包括：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -220,7 +241,7 @@ cuda_device_results/
 | `inductor_device_ms_per_step` | Inductor 单步 kernel 累计耗时，毫秒 |
 | `device_speedup` | eager device 耗时 / Inductor device 耗时 |
 | `profile_steps` | 每种模式实际采集轮数，应为 10 |
-| `status`、`exit_code`、`message` | `ok`、`failed` 或 `unsupported`，以及退出码和原因 |
+| `status`、`exit_code`、`message` | `pending`、`ok`、`failed` 或 `unsupported`，以及退出码和原因 |
 | `log_path`、`profile_path` | 该场景的日志和 profile 绝对路径 |
 
 汇总只读取原始 CSV 的 `eager_device_latency`、`compile_device_latency`、`device_speedup`，
