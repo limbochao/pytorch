@@ -45,8 +45,11 @@ NPU 直接使用其 `timm_models_list.txt` 中的 batch，不套用 CUDA 社区�
 | deit_base_distilled_patch16_224 | 128 | 128 |
 | deit_tiny_patch16_224.fb_in1k | 128 | 128 |
 | nfnet_l0 | 128 | 128 |
-| vit_base_patch14_dinov2.lvd142m | 128 | 128 |
+| vit_base_patch14_dinov2.lvd142m | 16 | 128 |
 | vit_base_patch16_siglip_256 | 128 | 128 |
+
+`vit_base_patch14_dinov2.lvd142m` 的训练默认 batch 按本次 CUDA 测试要求覆盖为 **16**。
+这是对来源配置的显式调整；进行同 batch 的 NPU 对比时，NPU 训练也应使用 batch 16。
 
 ## TorchBench
 

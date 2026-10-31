@@ -2,6 +2,7 @@
 
 TorchBench model source: fb14629994956c16d27c7a9940c5f081afbf68dc.
 Each pair is (training, inference); None means no NPU training default.
+The DINOv2 training batch is overridden to 16 for this CUDA test.
 """
 
 
@@ -31,7 +32,7 @@ NPU_BATCH_SIZES = {
         "deit_base_distilled_patch16_224": (128, 128),
         "deit_tiny_patch16_224.fb_in1k": (128, 128),
         "nfnet_l0": (128, 128),
-        "vit_base_patch14_dinov2.lvd142m": (128, 128),
+        "vit_base_patch14_dinov2.lvd142m": (16, 128),
         "vit_base_patch16_siglip_256": (128, 128),
     },
     "torchbench": {
