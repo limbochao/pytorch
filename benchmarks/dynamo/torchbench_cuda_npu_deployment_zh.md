@@ -157,6 +157,48 @@ python benchmark/install.py --verbose \
   functorch_maml_omniglot pytorch_stargan soft_actor_critic speech_transformer
 ```
 
+如果安装时仍出现证书错误，注意 TIMM 的 `TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1`
+只作用于 TIMM runner；benchmark 安装器的 S3 下载使用独立的 `requests.get()`，仍会校验证书。
+先用 `curl -k` 将三个原始输入文件放入安装器的缓存位置，再运行安装器。
+以下命令使用同一组官方 URL，成功下载后才替换缓存文件；安装器发现文件已存在便跳过网络下载，
+继续完成解压和依赖安装，无需修改 benchmark 源码或全局 Python 证书设置：
+
+```bash
+(
+  set -e
+  asset_base=https://ossci-datasets.s3.amazonaws.com/torchbench
+  for asset in \
+    models/maml_omniglot/batch.pt \
+    data/pytorch_stargan_inputs.tar.gz \
+    data/speech_transformer_inputs.tar.gz
+  do
+    target="benchmark/torchbenchmark/$asset"
+    mkdir -p "$(dirname -- "$target")"
+    curl -k --fail --location --retry 3 \
+      "$asset_base/$asset" --output "$target.download"
+    case "$asset" in
+      *.tar.gz) tar -tzf "$target.download" >/dev/null ;;
+    esac
+    mv -- "$target.download" "$target"
+  done
+  python benchmark/install.py --verbose \
+    functorch_maml_omniglot pytorch_stargan soft_actor_critic speech_transformer
+)
+```
+
+如果错误来自 `pip` 下载依赖，而不是 S3 输入下载，可对这一次安装设置 `PIP_TRUSTED_HOST`。
+使用官方 PyPI 时，在上面最后一条 `python benchmark/install.py` 前加以下环境变量：
+
+```bash
+PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-} pypi.org pypi.python.org files.pythonhosted.org" \
+  python benchmark/install.py --verbose \
+  functorch_maml_omniglot pytorch_stargan soft_actor_critic speech_transformer
+```
+
+使用自定义 pip 镜像时，还需将其实际域名加入 `PIP_TRUSTED_HOST`。
+此变量会传给安装器启动的 pip 子进程，但不会关闭 S3 的 requests 证书校验，
+因此不能替代上面的输入文件预下载。保留当前环境代理；本次修复不要求绕过代理。
+
 安装器将数据下载至 benchmark 源码树；它不读取 `TORCHBENCH_DATA_PATH`。
 如果之前设置了自定义路径，应把完整的 `pytorch_stargan_inputs` 和 `speech_transformer_inputs`
 目录放入该路径，或在本次运行中改用安装器的默认数据目录：
