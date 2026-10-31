@@ -137,6 +137,102 @@ export TORCHBENCH_DATA_PATH=/absolute/path/to/torchbench_data
 数据内容应与 NPU 相同，目录路径可以不同。此变量只指定数据位置，不负责下载数据；
 使用模型自身固定数据路径的场景，还需按该模型要求准备数据。
 
+### 3.1 加载阶段缺数据或依赖的修复
+
+`python benchmark/install.py dlrm` 只安装 DLRM，不会准备全部 40 个模型的数据和依赖。
+以下错误发生在模型加载阶段，尚未进入 Inductor 编译或 profile，不能据此判定模型不支持 CUDA。
+
+| 模型 | 报错原因 | 修复内容 |
+| --- | --- | --- |
+| `functorch_maml_omniglot` | 找不到 `maml_omniglot/batch.pt` | 安装原始输入文件，目录属于 `maml_omniglot` |
+| `pytorch_stargan` | 找不到 `list_attr_celeba.txt` | 解压完整的 `pytorch_stargan_inputs.tar.gz`，包含图片及标注 |
+| `soft_actor_critic` | 找不到 `gymnasium` | 安装该模型 requirements 中的 `gymnasium`、`pygame`、`tensorboardX` |
+| `speech_transformer` | 找不到 `train_chars.txt` | 解压完整的 `speech_transformer_inputs.tar.gz`，包含词表和 train/dev/test 输入 |
+| `torch_multimodal_clip` | 找不到 `torchbenchmark.util.framework.fb` | 缺少模型本地 `.data` 目录，触发内部下载入口；补齐官方 `pizza.jpg` |
+
+在 CUDA 的 `benchmarks/dynamo` 目录中，使用已固定版本的 benchmark 安装前四个模型：
+
+```bash
+python benchmark/install.py --verbose \
+  functorch_maml_omniglot pytorch_stargan soft_actor_critic speech_transformer
+```
+
+安装器将数据下载至 benchmark 源码树；它不读取 `TORCHBENCH_DATA_PATH`。
+如果之前设置了自定义路径，应把完整的 `pytorch_stargan_inputs` 和 `speech_transformer_inputs`
+目录放入该路径，或在本次运行中改用安装器的默认数据目录：
+
+```bash
+export TORCHBENCH_DATA_PATH="$PWD/benchmark/torchbenchmark/data/.data"
+```
+
+对于附件中已能导入 `torchmultimodal` 的 CLIP 环境，只补图片，保留与 NPU 对齐的已有依赖版本。
+以下 URL 与固定版本模型的公开 `install.py` 一致；`-k` 沿用测试容器跳过证书校验的设置，
+随后校验图片 SHA-256：
+
+```bash
+mkdir -p benchmark/torchbenchmark/models/torch_multimodal_clip/.data
+curl -k --fail --location --retry 3 \
+  https://ossci-assets.s3.us-east-1.amazonaws.com/2880px-Pizza-3007395.jpg \
+  --output benchmark/torchbenchmark/models/torch_multimodal_clip/.data/pizza.jpg
+python - <<'PY'
+import hashlib
+from pathlib import Path
+
+path = Path("benchmark/torchbenchmark/models/torch_multimodal_clip/.data/pizza.jpg")
+assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+    "580d3bb6381b0a249f9d90fb5e8b206c4a481308db78c493a74fd6c93984e0a0"
+), f"Unexpected image contents: {path}"
+print("CLIP image OK")
+PY
+```
+
+也可以从已经跑通的 NPU 环境复制相同数据，避免再次联网下载。
+NPU runner 将 CLIP 图片放在 `TORCHBENCH_DATA_PATH/pizza.jpg`；
+CUDA 固定版本模型使用 `benchmark/torchbenchmark/models/torch_multimodal_clip/.data/pizza.jpg`，
+需要复制到后者，单独设置 `TORCHBENCH_DATA_PATH` 不会改变 CLIP 的图片路径。
+`batch.pt` 同样使用模型源码树中的固定位置，不受该变量影响。
+
+安装器下载输入使用 `ossci-datasets.s3.amazonaws.com`，CLIP 图片来自 `ossci-assets.s3.us-east-1.amazonaws.com`。
+修改 `HF_ENDPOINT` 不会改变这些下载地址；若代理或证书导致下载失败，可从 NPU 环境复制完整数据。
+不要用空文件或随机输入代替缺失的原始数据。
+
+重跑前检查关键文件，并打开图片确认有效：
+
+```bash
+python - <<'PY'
+import os
+from pathlib import Path
+from PIL import Image
+import gymnasium
+import pygame
+import tensorboardX
+
+root = Path("benchmark/torchbenchmark")
+data = Path(os.environ.get("TORCHBENCH_DATA_PATH", root / "data/.data"))
+paths = [
+    root / "models/maml_omniglot/batch.pt",
+    data / "pytorch_stargan_inputs/data/celeba/list_attr_celeba.txt",
+    data / "speech_transformer_inputs/input_data/lang_1char/train_chars.txt",
+]
+paths.extend(
+    data / "speech_transformer_inputs/input_data" / split / name
+    for split in ("train", "dev", "test") for name in ("data.json", "feats.1.ark")
+)
+for path in paths:
+    assert path.is_file() and path.stat().st_size > 0, f"Missing or empty: {path}"
+assert any((data / "pytorch_stargan_inputs/data/celeba/images").glob("*.jpg"))
+with Image.open(root / "models/torch_multimodal_clip/.data/pizza.jpg") as image:
+    image.verify()
+print("Required inputs and dependencies found")
+PY
+```
+
+随后使用**原来的命令、相同的 `--models` 和相同的输出目录**重新执行一键脚本。
+已成功及已标记不支持的条目保留，只重试失败条目，成功后覆盖对应 CSV 汇总行。
+旧版脚本把加载失败占位 CSV 中的 `batch_size=0` 报为 batch 不匹配；
+新版先识别缺少 device profile 结果的占位行，并提示查看 `run.log` 中的原始异常。
+有效性能结果仍会检查实际 batch 是否与 NPU 默认值一致，无需为上述加载错误修改 batch。
+
 ## 4. CUDA 测试命令
 
 ### 4.0 一键执行指定的 40 个模型

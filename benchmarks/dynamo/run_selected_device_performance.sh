@@ -24,11 +24,13 @@ def read_result(path, model, expected_batch):
     if len(rows) != 1 or rows[0].get("name") != model or rows[0].get("dev") != "cuda":
         raise ValueError("expected exactly one CUDA result for this model")
     row = rows[0]
+    fields = ("eager_device_latency", "compile_device_latency", "device_speedup")
+    if not all(row.get(key) for key in (*fields, "device_profile_steps")):
+        raise ValueError("runner produced no device profile result; check the original traceback in run.log")
     if int(row["batch_size"]) != expected_batch:
         raise ValueError(f"batch size differs from NPU default {expected_batch}")
     if int(row["device_profile_steps"]) != 10:
         raise ValueError("expected 10 captured steps")
-    fields = ("eager_device_latency", "compile_device_latency", "device_speedup")
     if not all(math.isfinite(float(row[key])) and float(row[key]) > 0 for key in fields):
         raise ValueError("missing or invalid device timings")
     return {
