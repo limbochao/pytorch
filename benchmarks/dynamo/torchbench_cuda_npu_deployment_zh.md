@@ -167,8 +167,9 @@ bash benchmarks/dynamo/run_selected_device_performance.sh \
 默认使用当前环境的 `python`，也可以通过 `PYTHON=/path/to/python` 指定解释器。
 脚本不安装模型依赖；第 3 节的 `install.py dlrm` 只准备 DLRM，并不足以运行全部模型。
 
-TIMM 的 6 个模型运行时自动设置 `HF_ENDPOINT=https://hf-mirror.com` 和
-`TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1`，适配当前执行环境的镜像及证书要求。
+TIMM 的 6 个模型运行时默认使用 `HF_ENDPOINT=https://hf-mirror.com`，
+如果调用者已设置非空的 `HF_ENDPOINT`，则保留该地址，不再强制覆盖。
+脚本同时设置 `TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1`，适配当前执行环境的证书要求。
 后者让 TIMM runner 的 Hugging Face Hub 和 PyTorch URL 权重下载跳过证书校验，
 同时禁用 Xet 和旧版 `hf_transfer`，让下载走已配置的 Python HTTP 客户端。
 这些设置会写入该场景的 `command.sh`，仅传给 TIMM 进程；其他测试套保留调用者的环境配置。
@@ -180,6 +181,19 @@ export TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1
 ```
 
 未设置 `TORCHBENCH_TIMM_SKIP_SSL_VERIFY=1` 时，单模型 runner 保持默认的证书校验。
+
+如果通过当前代理访问镜像返回到 `https://huggingface.co/...` 的绝对地址 308 重定向，
+Hub 可能在尚未取得 `X-Repo-Commit` 时就停止元数据查询并报错。
+已确认官方站及 CDN 可达时，可直接指定官方入口：
+
+```bash
+export HF_ENDPOINT=https://huggingface.co
+```
+
+随后重新执行原来的一键命令，保持相同的模型选择和输出目录，即可只重试失败或未完成的场景。
+仅切换下载入口时可复用原结果目录；实际模型及性能测试配置应保持一致。
+保留已有可用代理；直连存在 DNS 解析失败时，禁用代理无法解决此问题。
+每次实际使用的 endpoint 都会记录在对应的 `command.sh` 中。
 
 执行顺序与 [40 个模型清单](npu_performance_batch_sizes_zh.md) 一致，
 每个模型先推理、后训练；全量执行保留 **80 行**，筛选 N 个模型时保留 **2 × N 行**。

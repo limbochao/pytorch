@@ -173,7 +173,10 @@ def main():
         else:
             overrides = {"CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"]}
             if suite == "timm_models":
-                overrides.update(HF_ENDPOINT="https://hf-mirror.com", TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1")
+                overrides.update(
+                    HF_ENDPOINT=env.get("HF_ENDPOINT") or "https://hf-mirror.com",
+                    TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1",
+                )
             run_env = dict(env, **overrides)
             command = [
                 sys.executable, "-u", str(runner_dir / f"{suite}.py"),
