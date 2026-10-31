@@ -51,6 +51,42 @@ def write_summary(path, columns, rows):
     temporary.replace(path)
 
 
+def collect_artifacts(run_dir, artifact_dir, model, scene):
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    sources = {}
+    missing = []
+    prefix = f"{model}_{scene}"
+    for mode, label in (("eager", "Eager"), ("compile", "Inductor")):
+        candidates = sorted((run_dir / "profile" / model / mode).rglob("op_statistics.csv"))
+        filename = f"{prefix}_{label}_GPU.csv"
+        if len(candidates) == 1:
+            sources[filename] = candidates[0]
+        else:
+            missing.append(f"{filename}: expected one op_statistics.csv, found {len(candidates)}")
+    names = ("output_code.py", "fx_graph_readable.py")
+    debug_dir = run_dir / "debug"
+    graphs = sorted({path.parent for name in names for path in debug_dir.rglob(name)})
+    if not graphs:
+        missing.append("Inductor output_code.py and fx_graph_readable.py: no debug graphs found")
+    for index, graph in enumerate(graphs, 1):
+        for name in names:
+            filename = f"{prefix}_Inductor_GPU_graph_{index:03d}_{graph.name}_{name}"
+            source = graph / name
+            if source.is_file():
+                sources[filename] = source
+            else:
+                missing.append(f"{graph.relative_to(debug_dir)}/{name}")
+    for filename, source in sources.items():
+        target = artifact_dir / filename
+        if not target.is_file():
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            shutil.copy2(source, temporary)
+            temporary.replace(target)
+    print(f"[artifacts] {len(sources)} files -> {artifact_dir}", flush=True)
+    for item in missing:
+        print(f"[artifacts] missing: {item}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="run_selected_device_performance.sh",
@@ -144,12 +180,19 @@ def main():
     print(f"Summary: {summary_path}", flush=True)
     for result in rows:
         order, suite, model, mode = (result[key] for key in ("order", "suite", "model", "mode"))
+        run_dir = output_dir / "runs" / f"{int(order):02d}_{suite}_{model}_{mode}"
+        scene = "Train" if mode == "training" else "Infer"
+        artifact_dir = output_dir / "perf" / f"{model}_{scene}"
         print(f"\n[{order}/{len(rows)}] {suite}/{model} {mode}", flush=True)
         if result["status"] in {"ok", "unsupported"}:
             print(f"skip: saved {result['status']}", flush=True)
+            if result["status"] == "ok":
+                try:
+                    collect_artifacts(run_dir, artifact_dir, model, scene)
+                except OSError as error:
+                    print(f"[artifacts] collection failed: {error}", flush=True)
             counts[result["status"]] += 1
             continue
-        run_dir = output_dir / "runs" / f"{int(order):02d}_{suite}_{model}_{mode}"
         log_path = run_dir / "run.log"
         profile_path = run_dir / "profile"
         result.update(dict.fromkeys((
@@ -162,8 +205,14 @@ def main():
         for stale in run_dir.glob("result*"):
             if stale.is_file():
                 stale.unlink()
-        if profile_path.exists():
-            shutil.rmtree(profile_path)
+        for stale in (profile_path, run_dir / "debug", run_dir / "cache"):
+            if stale.exists():
+                shutil.rmtree(stale)
+        for pattern in (f"{model}_{scene}_Eager_GPU.csv", f"{model}_{scene}_Inductor_GPU.csv",
+                        f"{model}_{scene}_Inductor_GPU_*.py"):
+            for stale in (*artifact_dir.glob(pattern), *artifact_dir.glob(pattern + ".tmp")):
+                if stale.is_file():
+                    stale.unlink()
         batch = selected[suite][model][0 if mode == "training" else 1]
         if mode == "training" and (batch is None or model == "cm3leon_generate"):
             result.update(status="unsupported", message=(
@@ -173,7 +222,14 @@ def main():
             log_path.write_text(result["message"] + "\n")
             print(f"unsupported: {result['message']}", flush=True)
         else:
-            overrides = {"CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"]}
+            overrides = {
+                "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
+                "TORCH_COMPILE_DEBUG": "1",
+                "TORCH_COMPILE_DEBUG_DIR": str(run_dir / "debug"),
+                "TORCHINDUCTOR_CACHE_DIR": str(run_dir / "cache" / "inductor"),
+                "TRITON_CACHE_DIR": str(run_dir / "cache" / "triton"),
+                "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1",
+            }
             if suite == "timm_models":
                 overrides.update(
                     HF_ENDPOINT=env.get("HF_ENDPOINT") or "https://hf-mirror.com",
@@ -216,6 +272,11 @@ def main():
                     result["message"] = f"invalid device result: {error}; see run.log"
             print(f"status: {result['status']} {result['message']}", flush=True)
         write_summary(summary_path, columns, rows)
+        if result["status"] != "unsupported":
+            try:
+                collect_artifacts(run_dir, artifact_dir, model, scene)
+            except OSError as error:
+                print(f"[artifacts] collection failed: {error}", flush=True)
         counts[result["status"]] += 1
     print(f"\nFinished: {counts}; summary: {summary_path}", flush=True)
     return int(counts["failed"] > 0)

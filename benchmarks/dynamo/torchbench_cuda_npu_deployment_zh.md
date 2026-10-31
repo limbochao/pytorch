@@ -349,11 +349,22 @@ export HF_ENDPOINT=https://huggingface.co
 ```text
 cuda_device_results/
   summary.csv
+  perf/
+    AlbertForMaskedLM_Infer/
+      AlbertForMaskedLM_Infer_Eager_GPU.csv
+      AlbertForMaskedLM_Infer_Inductor_GPU.csv
+      AlbertForMaskedLM_Infer_Inductor_GPU_graph_001_model__0_inference_0.0_output_code.py
+      AlbertForMaskedLM_Infer_Inductor_GPU_graph_001_model__0_inference_0.0_fx_graph_readable.py
+    AlbertForMaskedLM_Train/
+      ...
   runs/
     01_huggingface_AlbertForMaskedLM_inference/
       command.sh
       run.log
       result.csv
+      debug/torch_compile_debug/run_*/torchinductor/
+        model__0_inference_0.0/{output_code.py,fx_graph_readable.py,...}
+      cache/{inductor,triton}/
       profile/AlbertForMaskedLM/
         eager/performance_*/{trace.json,op_statistics.csv}
         compile/performance_*/{trace.json,op_statistics.csv}
@@ -364,18 +375,53 @@ cuda_device_results/
 `--output-dir` 相对于启动命令所在目录。首次运行可指定新目录或空目录，
 省略时在启动目录创建带时间戳的结果目录。
 
+每个实际执行的场景结束后，脚本自动把产物收集到 `输出目录/perf/模型名_Train或Infer/`：
+
+- eager 的 `op_statistics.csv` 复制为 `场景名_Eager_GPU.csv`。
+- Inductor 的 `op_statistics.csv` 复制为 `场景名_Inductor_GPU.csv`。
+- 每个编译图的 `output_code.py`、`fx_graph_readable.py` 分别复制，保留原文件内容。
+  文件名前缀为 `场景名_Inductor_GPU_graph_编号_原图目录名_`。
+
+目录和 CSV 名称沿用参考 `perf` 目录的规则。单个图共 4 个文件；多个图分别保存两个 py，
+包括训练的前向、反向图及 graph break 后的图，不会合并或只取其中一个。
+编号按本次 debug 图目录的排序生成，前向/反向信息保留在原图目录名中。
+原始 profile、debug 文件仍保留在对应的 `runs/` 场景目录。
+
+脚本对每个 runner 进程自动设置以下环境变量，并写入该场景的 `command.sh`：
+
+```text
+TORCH_COMPILE_DEBUG=1
+TORCH_COMPILE_DEBUG_DIR=<该场景 runs 目录>/debug
+TORCHINDUCTOR_CACHE_DIR=<该场景 runs 目录>/cache/inductor
+TRITON_CACHE_DIR=<该场景 runs 目录>/cache/triton
+TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+```
+
+每个场景使用独立缓存目录，实际重试前清理该场景的 debug 和缓存，同时禁用编译图缓存复用，
+使已有的本地或远程图缓存不会阻止本次生成 debug 产物。调用者原来的缓存目录不会被清理。
+首次编译发生在预热阶段，device 耗时仍按预热后的 10 轮 profile 计算。
+
+失败场景收集已经生成的部分文件，并以 `[artifacts] missing:` 提示缺失项；
+加载失败或尚未生成编译图时，无法收齐全部文件。收集错误会单独打印，不覆盖性能测试状态，
+`summary.csv` 继续表达模型性能测试是否成功。`unsupported` 场景不启动 runner，也不生成这些产物。
+
 **失败后再次执行原命令，并保持同一个 `--output-dir`，即可自动重试，无需额外参数。**
 脚本读取已有的 `summary.csv`，按模型及推理/训练模式分别判断：
 
-- `ok`：保留已有耗时、日志和 profile，跳过执行。
+- `ok`：保留已有耗时、日志和 profile，跳过模型执行，并从已有原始文件补收缺失的汇总产物。
 - `unsupported`：保留不支持记录，跳过执行。
 - `failed` 或 `pending`：重新执行；中断前尚未记录的场景也会补跑。
 
 例如推理已经成功、训练失败，再次启动只会重试该模型的训练。
 每次启动对待重试的场景各执行一次；仍失败则保留 `failed`，下次原命令可继续重试。
-重试会清理该场景的旧 `result*` 文件和 profile，并覆盖日志及运行命令；
-成功后原位更新耗时、加速比、退出码和状态，其他已成功场景保持不变。
+重试会清理该场景的旧 `result*` 文件、profile、debug 和缓存，并覆盖日志及运行命令；
+同时清理该场景此前汇总的 GPU 文件，再按本次执行结果收集，防止残留旧图。
+同目录下另行放入的 NPU 对照文件保留。成功后原位更新耗时、加速比、退出码和状态，
+其他已成功场景的耗时、日志、profile 及已汇总文件保持不变。
 全部场景已成功或不支持时，再次执行会直接跳过，不启动模型或 CUDA 检查。
+
+旧版脚本运行成功的场景如果没有开启 debug，只能补收已有 CSV，无法凭空补出两个 py。
+需要收齐这些场景的编译产物时，使用新的输出目录重新执行，可通过 `--models` 筛选要补采的模型。
 
 重试时保持原来的模型选择、设备和测试配置；更换这些配置时使用新的输出目录。
 已有非空目录必须包含格式正确且模型顺序匹配的 `summary.csv`，避免误用其他测试产物。
