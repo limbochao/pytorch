@@ -16,6 +16,9 @@ from pathlib import Path
 runner_dir = Path(sys.argv[1])
 sys.path.insert(0, str(runner_dir))
 from npu_batch_sizes import NPU_BATCH_SIZES
+from device_perf_artifacts import ArtifactCollector
+
+artifacts = ArtifactCollector("GPU", "op_statistics.csv")
 
 
 def read_result(path, model, expected_batch):
@@ -48,43 +51,33 @@ def write_summary(path, columns, rows):
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    temporary.replace(path)
+    if path.is_file() and path.read_bytes() == temporary.read_bytes():
+        temporary.unlink()
+    else:
+        temporary.replace(path)
 
 
-def collect_artifacts(run_dir, artifact_dir, model, scene):
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    sources = {}
-    missing = []
-    prefix = f"{model}_{scene}"
-    for mode, label in (("eager", "Eager"), ("compile", "Inductor")):
-        candidates = sorted((run_dir / "profile" / model / mode).rglob("op_statistics.csv"))
-        filename = f"{prefix}_{label}_GPU.csv"
-        if len(candidates) == 1:
-            sources[filename] = candidates[0]
-        else:
-            missing.append(f"{filename}: expected one op_statistics.csv, found {len(candidates)}")
-    names = ("output_code.py", "fx_graph_readable.py")
-    debug_dir = run_dir / "debug"
-    graphs = sorted({path.parent for name in names for path in debug_dir.rglob(name)})
-    if not graphs:
-        missing.append("Inductor output_code.py and fx_graph_readable.py: no debug graphs found")
-    for index, graph in enumerate(graphs, 1):
-        for name in names:
-            filename = f"{prefix}_Inductor_GPU_graph_{index:03d}_{graph.name}_{name}"
-            source = graph / name
-            if source.is_file():
-                sources[filename] = source
-            else:
-                missing.append(f"{graph.relative_to(debug_dir)}/{name}")
-    for filename, source in sources.items():
-        target = artifact_dir / filename
-        if not target.is_file():
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            shutil.copy2(source, temporary)
-            temporary.replace(target)
-    print(f"[artifacts] {len(sources)} files -> {artifact_dir}", flush=True)
-    for item in missing:
-        print(f"[artifacts] missing: {item}", flush=True)
+def scenario_command(run_dir, suite, model, mode, env):
+    overrides = {
+        "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
+        "TORCH_COMPILE_DEBUG": "1",
+        "TORCH_COMPILE_DEBUG_DIR": str(run_dir / "debug"),
+        "TORCHINDUCTOR_CACHE_DIR": str(run_dir / "cache" / "inductor"),
+        "TRITON_CACHE_DIR": str(run_dir / "cache" / "triton"),
+        "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1",
+    }
+    if suite == "timm_models":
+        overrides.update(HF_ENDPOINT=env.get("HF_ENDPOINT") or "https://hf-mirror.com",
+                         TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1")
+    command = [
+        sys.executable, "-u", str(runner_dir / f"{suite}.py"),
+        "--performance", "--repeat", "1", "--iterations", "1", "--iterations-per-run", "1",
+        f"--{mode}", "--float32", "--device", "cuda", "--backend", "inductor",
+        "--disable-cudagraphs", "--npu-parity", "--only", model,
+        "--enable-profiler", "0", "--prof-output-path", str(run_dir / "profile"), "--device-perf",
+        "--output", "result.csv", "--output-directory", str(run_dir),
+    ]
+    return command, overrides
 
 
 def main():
@@ -161,7 +154,14 @@ def main():
     elif output_dir.exists() and any(path.name != "summary.tmp" for path in output_dir.iterdir()):
         parser.error(f"nonempty results directory has no summary.csv: {output_dir}")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.device.strip(), PYTHONUNBUFFERED="1")
-    if any(row["status"] not in {"ok", "unsupported"} for row in rows):
+    needs_device = any(row["status"] not in {"ok", "unsupported"} for row in rows)
+    for row in rows:
+        if row["status"] == "ok":
+            scene = "Train" if row["mode"] == "training" else "Infer"
+            missing = artifacts.collect(Path(row["log_path"]).parent, output_dir / "perf" / f"{row['model']}_{scene}",
+                                        row["model"], scene, copy=False, report=False)
+            needs_device = needs_device or bool(missing)
+    if needs_device:
         preflight = subprocess.run(
             [sys.executable, "-c", (
                 "import torch; "
@@ -176,6 +176,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     write_summary(summary_path, columns, rows)
     counts = {"ok": 0, "failed": 0, "unsupported": 0}
+    repair_failures = 0
     print(f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} (runner device: cuda:0)", flush=True)
     print(f"Summary: {summary_path}", flush=True)
     for result in rows:
@@ -183,13 +184,17 @@ def main():
         run_dir = output_dir / "runs" / f"{int(order):02d}_{suite}_{model}_{mode}"
         scene = "Train" if mode == "training" else "Infer"
         artifact_dir = output_dir / "perf" / f"{model}_{scene}"
+        command, overrides = scenario_command(run_dir, suite, model, mode, env)
         print(f"\n[{order}/{len(rows)}] {suite}/{model} {mode}", flush=True)
         if result["status"] in {"ok", "unsupported"}:
             print(f"skip: saved {result['status']}", flush=True)
             if result["status"] == "ok":
                 try:
-                    collect_artifacts(run_dir, artifact_dir, model, scene)
-                except OSError as error:
+                    if not artifacts.repair(run_dir, artifact_dir, model, scene, result["batch_size"],
+                                            command, env, overrides):
+                        repair_failures += 1
+                except (OSError, ValueError, KeyError, csv.Error) as error:
+                    repair_failures += 1
                     print(f"[artifacts] collection failed: {error}", flush=True)
             counts[result["status"]] += 1
             continue
@@ -205,7 +210,7 @@ def main():
         for stale in run_dir.glob("result*"):
             if stale.is_file():
                 stale.unlink()
-        for stale in (profile_path, run_dir / "debug", run_dir / "cache"):
+        for stale in (profile_path, run_dir / "debug", run_dir / "cache", run_dir / "repair"):
             if stale.exists():
                 shutil.rmtree(stale)
         for pattern in (f"{model}_{scene}_Eager_GPU.csv", f"{model}_{scene}_Inductor_GPU.csv",
@@ -222,28 +227,7 @@ def main():
             log_path.write_text(result["message"] + "\n")
             print(f"unsupported: {result['message']}", flush=True)
         else:
-            overrides = {
-                "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
-                "TORCH_COMPILE_DEBUG": "1",
-                "TORCH_COMPILE_DEBUG_DIR": str(run_dir / "debug"),
-                "TORCHINDUCTOR_CACHE_DIR": str(run_dir / "cache" / "inductor"),
-                "TRITON_CACHE_DIR": str(run_dir / "cache" / "triton"),
-                "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1",
-            }
-            if suite == "timm_models":
-                overrides.update(
-                    HF_ENDPOINT=env.get("HF_ENDPOINT") or "https://hf-mirror.com",
-                    TORCHBENCH_TIMM_SKIP_SSL_VERIFY="1",
-                )
             run_env = dict(env, **overrides)
-            command = [
-                sys.executable, "-u", str(runner_dir / f"{suite}.py"),
-                "--performance", "--repeat", "1", "--iterations", "1", "--iterations-per-run", "1",
-                f"--{mode}", "--float32", "--device", "cuda", "--backend", "inductor",
-                "--disable-cudagraphs", "--npu-parity", "--only", model,
-                "--enable-profiler", "0", "--prof-output-path", str(profile_path), "--device-perf",
-                "--output", "result.csv", "--output-directory", str(run_dir),
-            ]
             (run_dir / "command.sh").write_text(
                 "".join(f"export {key}={shlex.quote(value)}\n" for key, value in overrides.items())
                 + f"cd {shlex.quote(str(runner_dir))}\n{shlex.join(command)}\n"
@@ -274,12 +258,19 @@ def main():
         write_summary(summary_path, columns, rows)
         if result["status"] != "unsupported":
             try:
-                collect_artifacts(run_dir, artifact_dir, model, scene)
-            except OSError as error:
+                if result["status"] == "ok":
+                    if not artifacts.repair(run_dir, artifact_dir, model, scene, result["batch_size"],
+                                            command, env, overrides):
+                        repair_failures += 1
+                else:
+                    artifacts.collect(run_dir, artifact_dir, model, scene)
+            except (OSError, ValueError, KeyError, csv.Error) as error:
+                repair_failures += 1
                 print(f"[artifacts] collection failed: {error}", flush=True)
         counts[result["status"]] += 1
     print(f"\nFinished: {counts}; summary: {summary_path}", flush=True)
-    return int(counts["failed"] > 0)
+    print(f"Artifact repair failures: {repair_failures}", flush=True)
+    return int(counts["failed"] > 0 or repair_failures > 0)
 
 
 try:

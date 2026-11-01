@@ -3012,6 +3012,13 @@ class BenchmarkRunner:
         )
 
         with self.pick_grad(name, self.args.training), ctx:
+            if self.args.compile_only:
+                compiled = optimize_ctx(self.model_iter_fn)
+                for _ in range(5):
+                    compiled(model, example_inputs)
+                synchronize()
+                print(f"[compile-only] batch_size={current_batch_size}", flush=True)
+                return "compiled"
             ok, total = Stats.reset_counters()
             experiment_kwargs = {}
             experiment_kwargs["batch_size"] = batch_size
@@ -3920,6 +3927,9 @@ def parse_args(args=None):
         help="finds the largest batch size that could fit on GPUs",
     )
 
+    parser.add_argument(
+        "--compile-only", action="store_true", help="Generate compiled graphs without timing or profiling"
+    )
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
         "--accuracy",
@@ -3944,6 +3954,10 @@ def parse_args(args=None):
         "--inference", action="store_true", help="Performs inference"
     )
     parsed = parser.parse_args(args)
+    if parsed.compile_only and (
+        not parsed.performance or parsed.backend != "inductor" or parsed.enable_profiler is not None
+    ):
+        parser.error("--compile-only requires --performance --backend inductor without --enable-profiler")
     if parsed.device_perf and parsed.enable_profiler is None:
         parser.error("--device-perf requires --performance and --enable-profiler")
     if parsed.enable_profiler is not None:

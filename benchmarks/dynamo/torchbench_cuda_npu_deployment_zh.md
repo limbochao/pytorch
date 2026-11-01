@@ -365,6 +365,7 @@ cuda_device_results/
       debug/torch_compile_debug/run_*/torchinductor/
         model__0_inference_0.0/{output_code.py,fx_graph_readable.py,...}
       cache/{inductor,triton}/
+      repair/                 # 自动补齐产物的独立命令、日志、debug 和缓存
       profile/AlbertForMaskedLM/
         eager/performance_*/{trace.json,op_statistics.csv}
         compile/performance_*/{trace.json,op_statistics.csv}
@@ -408,7 +409,7 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
 **失败后再次执行原命令，并保持同一个 `--output-dir`，即可自动重试，无需额外参数。**
 脚本读取已有的 `summary.csv`，按模型及推理/训练模式分别判断：
 
-- `ok`：保留已有耗时、日志和 profile，跳过模型执行，并从已有原始文件补收缺失的汇总产物。
+- `ok`：保留已有耗时、日志和 profile，跳过性能测试；检查汇总产物，缺少时自动补齐。
 - `unsupported`：保留不支持记录，跳过执行。
 - `failed` 或 `pending`：重新执行；中断前尚未记录的场景也会补跑。
 
@@ -418,10 +419,25 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
 同时清理该场景此前汇总的 GPU 文件，再按本次执行结果收集，防止残留旧图。
 同目录下另行放入的 NPU 对照文件保留。成功后原位更新耗时、加速比、退出码和状态，
 其他已成功场景的耗时、日志、profile 及已汇总文件保持不变。
-全部场景已成功或不支持时，再次执行会直接跳过，不启动模型或 CUDA 检查。
+全部场景已成功或不支持、且产物可从现有文件补齐时，不启动模型或 CUDA 检查。
 
-旧版脚本运行成功的场景如果没有开启 debug，只能补收已有 CSV，无法凭空补出两个 py。
-需要收齐这些场景的编译产物时，使用新的输出目录重新执行，可通过 `--models` 筛选要补采的模型。
+**旧成功场景无需更换输出目录。再次执行原命令即可自动补齐编译产物。**
+
+脚本先从原始 profile 和 debug 复制缺失文件；如果编译产物确实不存在，会使用独立的
+`runs/场景目录/repair/`，调用 runner 的 `--performance --backend inductor --compile-only`。
+此模式按原场景的推理/训练、FP32、编译后端以及 **summary 中保存的实际 batch** 加载模型，
+执行与原编译预热一致的 5 轮，生成全部编译图后退出，不运行 eager 计时、性能比较或 profiler。
+它不会将新的性能数值写回原 `summary.csv`、`result.csv`，也不覆盖原日志、profile 和已收集的 CSV。
+例如旧结果是训练 batch 128，即使后来默认改成 16，补编译仍使用保存的 128。
+
+若汇总 CSV 和它对应的原始 profile 文件也都丢失，则在同一个 `repair/` 目录执行独立性能采集，
+仅补齐缺失的 CSV；原性能数值及其他已有 CSV 仍保留。这种补采 CSV 来自新采集，
+不能将其中的 kernel 耗时当作原 summary 那次测量的明细。
+
+补齐命令和输出分别记录在 `repair/command.sh`、`repair/run.log`；编译仍使用全新的独立缓存。
+补齐成功前会核对保存的 batch 和全部图文件，失败的补编译产物不会作为已完成结果使用。
+补齐失败时原性能状态仍为 `ok`，脚本返回 1；下次同一命令会继续尝试补齐。
+全部产物齐全后，再次启动直接复用，不重新编译或测试。
 
 重试时保持原来的模型选择、设备和测试配置；更换这些配置时使用新的输出目录。
 已有非空目录必须包含格式正确且模型顺序匹配的 `summary.csv`，避免误用其他测试产物。
@@ -447,7 +463,7 @@ summary 在启动时列出本次计划的全部场景，未完成的状态为 `p
 `llama` 和 `cm3leon_generate` 的训练标记为 `unsupported`，不启动 runner，耗时留空。
 其他场景失败时标记为 `failed` 并继续后续模型，耗时留空，不能当作 0 ms 或有效加速比。
 即使 runner 返回 0，缺少有效 device 结果、采样轮数或 batch 不匹配也会标记失败。
-全部结束后如有 `failed`，脚本返回 1；只有 `ok` 和上述预期的 `unsupported` 时返回 0。
+全部结束后如有性能测试失败或产物补齐失败，脚本返回 1；性能与产物均完成后返回 0。
 
 ### 单模型命令
 
