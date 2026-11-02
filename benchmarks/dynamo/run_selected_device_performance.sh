@@ -98,8 +98,6 @@ def main():
         help="space-separated exact model names from the 40-model list; defaults to all models",
     )
     args = parser.parse_args(sys.argv[2:])
-    if not args.device.strip() or "," in args.device or args.device.strip() == "-1":
-        parser.error("--device must select exactly one GPU")
     requested = set(args.models or ())
     known = {model for models in NPU_BATCH_SIZES.values() for model in models}
     unknown = requested - known
@@ -112,6 +110,20 @@ def main():
     output_dir = args.output_dir or Path(f"cuda_device_performance_{datetime.now():%Y%m%d_%H%M%S_%f}")
     output_dir = output_dir.expanduser().resolve()
     summary_path = output_dir / "summary.csv"
+    if output_dir.is_dir():
+        try:
+            for tag in ("GPU", "NPU"):
+                ArtifactCollector(tag, "").rename_existing(output_dir)
+        except (OSError, ValueError) as error:
+            parser.error(f"cannot rename collected artifacts: {error}")
+        if not summary_path.exists() and (
+            (output_dir / "perf").is_dir()
+            or any(output_dir.glob("*/GPU_g*.py")) or any(output_dir.glob("*/NPU_g*.py"))
+        ):
+            print(f"Collected Python filenames updated: {output_dir}; no models executed", flush=True)
+            return 0
+    if not args.device.strip() or "," in args.device or args.device.strip() == "-1":
+        parser.error("--device must select exactly one GPU")
     columns = [
         "order", "suite", "model", "mode", "batch_size", "eager_device_ms_per_step",
         "inductor_device_ms_per_step", "device_speedup", "profile_steps", "status", "exit_code",
@@ -214,7 +226,7 @@ def main():
             if stale.exists():
                 shutil.rmtree(stale)
         for pattern in (f"{model}_{scene}_Eager_GPU.csv", f"{model}_{scene}_Inductor_GPU.csv",
-                        f"{model}_{scene}_Inductor_GPU_*.py"):
+                        f"{model}_{scene}_Inductor_GPU_*.py", "GPU_g*.py"):
             for stale in (*artifact_dir.glob(pattern), *artifact_dir.glob(pattern + ".tmp")):
                 if stale.is_file():
                     stale.unlink()

@@ -353,8 +353,8 @@ cuda_device_results/
     AlbertForMaskedLM_Infer/
       AlbertForMaskedLM_Infer_Eager_GPU.csv
       AlbertForMaskedLM_Infer_Inductor_GPU.csv
-      AlbertForMaskedLM_Infer_Inductor_GPU_graph_001_model__0_inference_0.0_output_code.py
-      AlbertForMaskedLM_Infer_Inductor_GPU_graph_001_model__0_inference_0.0_fx_graph_readable.py
+      GPU_g01_output_code.py
+      GPU_g01_fx_graph_readable.py
     AlbertForMaskedLM_Train/
       ...
   runs/
@@ -381,12 +381,23 @@ cuda_device_results/
 - eager 的 `op_statistics.csv` 复制为 `场景名_Eager_GPU.csv`。
 - Inductor 的 `op_statistics.csv` 复制为 `场景名_Inductor_GPU.csv`。
 - 每个编译图的 `output_code.py`、`fx_graph_readable.py` 分别复制，保留原文件内容。
-  文件名前缀为 `场景名_Inductor_GPU_graph_编号_原图目录名_`。
+  文件名为 `GPU_g01_output_code.py`、`GPU_g01_fx_graph_readable.py`，后续图使用 `g02`、`g03` 等编号。
 
 目录和 CSV 名称沿用参考 `perf` 目录的规则。单个图共 4 个文件；多个图分别保存两个 py，
 包括训练的前向、反向图及 graph break 后的图，不会合并或只取其中一个。
-编号按本次 debug 图目录的排序生成，前向/反向信息保留在原图目录名中。
+编号按本次 debug 图目录的排序生成；GPU 和 NPU 各自编号，不表示两端的图一一对应。
 原始 profile、debug 文件仍保留在对应的 `runs/` 场景目录。
+
+再次执行原命令时，脚本默认将指定输出目录内已收集的旧长文件名改为上述短文件名，
+同时更新图文件清单。CSV 名称、内容和已有性能数据保持不变；完整的成功场景不重跑。
+如果只保留了 `perf`，也可直接指定该目录整理文件名，不需要 summary、模型环境或计算卡：
+
+```bash
+bash benchmarks/dynamo/run_selected_device_performance.sh --output-dir /path/to/perf
+```
+
+迁移同时识别 GPU、NPU 文件；重复执行不会再次修改已迁移文件。
+若目标短文件名已存在且内容不同，停止并报告冲突，保留双方文件。
 
 脚本对每个 runner 进程自动设置以下环境变量，并写入该场景的 `command.sh`：
 

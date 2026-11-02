@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -10,6 +11,52 @@ class ArtifactCollector:
     def __init__(self, device_tag, csv_name):
         self.device_tag = device_tag
         self.csv_name = csv_name
+
+    def short_name(self, filename):
+        match = re.fullmatch(
+            rf".+_Inductor_{self.device_tag}_graph_(\d+)_.+_(output_code\.py|fx_graph_readable\.py)", filename,
+        )
+        if match:
+            return f"{self.device_tag}_g{int(match[1]):02d}_{match[2]}"
+        return filename
+
+    def rename_existing(self, output_dir):
+        perf_dir = output_dir / "perf" if (output_dir / "perf").is_dir() else output_dir
+        renames = {}
+        for scene in sorted(perf_dir.iterdir()):
+            if not scene.is_dir():
+                continue
+            for source in sorted(scene.glob(f"*_Inductor_{self.device_tag}_graph_*.py")):
+                target = source.with_name(self.short_name(source.name))
+                if source == target:
+                    continue
+                existing = target if target.exists() else renames.get(target)
+                if existing is not None and existing.read_bytes() != source.read_bytes():
+                    raise ValueError(f"cannot rename {source}: different content already maps to {target}")
+                renames[target] = source
+        count = 0
+        for scene in sorted(perf_dir.iterdir()):
+            if not scene.is_dir():
+                continue
+            for source in sorted(scene.glob(f"*_Inductor_{self.device_tag}_graph_*.py")):
+                target = source.with_name(self.short_name(source.name))
+                if source != target:
+                    if target.exists():
+                        source.unlink()
+                    else:
+                        source.rename(target)
+                    count += 1
+        run_root = output_dir.parent if output_dir.name == "perf" else output_dir
+        for manifest in (run_root / "runs").glob(f"*/graphs_{self.device_tag}.json"):
+            names = json.loads(manifest.read_text())
+            updated = [self.short_name(name) for name in names]
+            if updated != names:
+                temporary = manifest.with_suffix(".tmp")
+                temporary.write_text(json.dumps(updated, indent=2) + "\n")
+                temporary.replace(manifest)
+        if count:
+            print(f"[artifacts] renamed {count} {self.device_tag} Python files in {perf_dir}", flush=True)
+        return count
 
     def collect(self, run_dir, artifact_dir, model, scene, copy=True, report=True):
         prefix = f"{model}_{scene}"
@@ -38,7 +85,7 @@ class ArtifactCollector:
                 break
         for index, graph in enumerate(graphs, 1):
             for name in names:
-                filename = f"{prefix}_Inductor_{self.device_tag}_graph_{index:03d}_{graph.name}_{name}"
+                filename = f"{self.device_tag}_g{index:02d}_{name}"
                 if (artifact_dir / filename).is_file():
                     sources[filename] = None
                 elif (graph / name).is_file():
@@ -46,12 +93,13 @@ class ArtifactCollector:
                 else:
                     missing[filename] = str(graph / name)
         if not graphs:
-            codes = set(artifact_dir.glob(f"{prefix}_Inductor_{self.device_tag}_*_output_code.py"))
-            readable = set(artifact_dir.glob(f"{prefix}_Inductor_{self.device_tag}_*_fx_graph_readable.py"))
+            codes = set(artifact_dir.glob(f"{self.device_tag}_g*_output_code.py"))
+            readable = set(artifact_dir.glob(f"{self.device_tag}_g*_fx_graph_readable.py"))
             paired = {path.with_name(path.name.removesuffix("output_code.py") + "fx_graph_readable.py")
                       for path in codes}
             if manifest.is_file():
-                for filename in json.loads(manifest.read_text()):
+                for saved_name in json.loads(manifest.read_text()):
+                    filename = self.short_name(saved_name)
                     if (artifact_dir / filename).is_file():
                         sources[filename] = None
                     else:
@@ -155,7 +203,8 @@ class ArtifactCollector:
             print(f"[artifacts] repair produced incomplete graphs; see {work_dir / 'run.log'}", flush=True)
             return False
         prefix = f"{model}_{scene}_Inductor_{self.device_tag}_"
-        for pattern in (prefix + "*.py", prefix + "*.py.tmp"):
+        for pattern in (prefix + "*.py", prefix + "*.py.tmp",
+                        f"{self.device_tag}_g*.py", f"{self.device_tag}_g*.py.tmp"):
             for stale in artifact_dir.glob(pattern):
                 if stale.is_file():
                     stale.unlink()
